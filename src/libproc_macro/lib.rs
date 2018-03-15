@@ -42,7 +42,6 @@
 #![feature(box_into_raw_non_null)]
 #![feature(nonnull_cast)]
 
-#[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
 extern crate rustc_errors;
@@ -602,9 +601,9 @@ impl Iterator for TokenTreeIter {
     type Item = TokenTree;
 
     fn next(&mut self) -> Option<TokenTree> {
-        let next = unwrap_or!(self.next.take().or_else(|| {
+        let next = self.next.take().or_else(|| {
             Frontend.token_cursor_next(&mut self.cursor)
-        }), return None);
+        })?;
         let (span, kind) = match Frontend.token_stream_to_token_tree(next) {
             (span, Ok((kind, next))) => {
                 self.next = next;
