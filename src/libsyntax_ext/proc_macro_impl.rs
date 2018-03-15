@@ -17,11 +17,8 @@ use syntax::ext::base::*;
 use syntax::tokenstream::TokenStream;
 use syntax::ext::base;
 
-use proc_macro::TokenStream as TsShim;
-use proc_macro::__internal;
-
 pub struct AttrProcMacro {
-    pub inner: fn(TsShim, TsShim) -> TsShim,
+    pub inner: ::proc_macro::bridge::Expand2,
 }
 
 impl base::AttrProcMacro for AttrProcMacro {
@@ -31,15 +28,14 @@ impl base::AttrProcMacro for AttrProcMacro {
                    annotation: TokenStream,
                    annotated: TokenStream)
                    -> TokenStream {
-        let annotation = __internal::token_stream_wrap(annotation);
-        let annotated = __internal::token_stream_wrap(annotated);
-
-        let res = __internal::set_sess(ecx, || {
-            panic::catch_unwind(panic::AssertUnwindSafe(|| (self.inner)(annotation, annotated)))
-        });
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            ::proc_macro::__internal::set_sess(ecx, || {
+                self.inner.run(::proc_macro::rustc::Rustc, annotation, annotated)
+            })
+        }));
 
         match res {
-            Ok(stream) => __internal::token_stream_inner(stream),
+            Ok(stream) => stream,
             Err(e) => {
                 let msg = "custom attribute panicked";
                 let mut err = ecx.struct_span_fatal(span, msg);
@@ -58,7 +54,7 @@ impl base::AttrProcMacro for AttrProcMacro {
 }
 
 pub struct BangProcMacro {
-    pub inner: fn(TsShim) -> TsShim,
+    pub inner: ::proc_macro::bridge::Expand1,
 }
 
 impl base::ProcMacro for BangProcMacro {
@@ -67,14 +63,14 @@ impl base::ProcMacro for BangProcMacro {
                    span: Span,
                    input: TokenStream)
                    -> TokenStream {
-        let input = __internal::token_stream_wrap(input);
-
-        let res = __internal::set_sess(ecx, || {
-            panic::catch_unwind(panic::AssertUnwindSafe(|| (self.inner)(input)))
-        });
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            ::proc_macro::__internal::set_sess(ecx, || {
+                self.inner.run(::proc_macro::rustc::Rustc, input)
+            })
+        }));
 
         match res {
-            Ok(stream) => __internal::token_stream_inner(stream),
+            Ok(stream) => stream,
             Err(e) => {
                 let msg = "proc macro panicked";
                 let mut err = ecx.struct_span_fatal(span, msg);

@@ -1,0 +1,282 @@
+// Copyright 2018 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+use {__internal, Delimiter, Spacing, Span, Term, TokenNode, TokenTree};
+
+use syntax_pos::{self, SyntaxContext, FileName};
+use syntax_pos::hygiene::Mark;
+use syntax::ast;
+use syntax::ext::base::{ExtCtxt, ProcMacro};
+use syntax::parse::{self, token};
+use syntax::tokenstream;
+
+pub struct Quoter;
+
+impl ProcMacro for Quoter {
+    fn expand<'cx>(&self, cx: &'cx mut ExtCtxt,
+                _: syntax_pos::Span,
+                stream: tokenstream::TokenStream)
+                -> tokenstream::TokenStream {
+        let expand_quoter = ::bridge::Expand1::new(&::quote::Quote::quote);
+
+        let mut info = cx.current_expansion.mark.expn_info().unwrap();
+        info.callee.allow_internal_unstable = true;
+        cx.current_expansion.mark.set_expn_info(info);
+        __internal::set_sess(cx, || expand_quoter.run(Rustc, stream))
+    }
+}
+
+impl Delimiter {
+    fn from_internal(delim: token::DelimToken) -> Delimiter {
+        match delim {
+            token::Paren => Delimiter::Parenthesis,
+            token::Brace => Delimiter::Brace,
+            token::Bracket => Delimiter::Bracket,
+            token::NoDelim => Delimiter::None,
+        }
+    }
+
+    fn to_internal(self) -> token::DelimToken {
+        match self {
+            Delimiter::Parenthesis => token::Paren,
+            Delimiter::Brace => token::Brace,
+            Delimiter::Bracket => token::Bracket,
+            Delimiter::None => token::NoDelim,
+        }
+    }
+}
+
+pub struct Rustc;
+impl ::bridge::FrontendInterface for Rustc {
+    type TokenStream = tokenstream::TokenStream;
+    type TokenStreamBuilder = tokenstream::TokenStreamBuilder;
+    type TokenCursor = tokenstream::Cursor;
+
+
+    fn token_stream_empty(&self) -> Self::TokenStream {
+        tokenstream::TokenStream::empty()
+    }
+    fn token_stream_is_empty(&self, stream: &Self::TokenStream) -> bool {
+        stream.is_empty()
+    }
+    fn token_stream_from_str(&self, src: &str) -> Result<Self::TokenStream, ::LexError> {
+        ::__internal::with_sess(|(sess, mark)| {
+            let src = src.to_string();
+            let name = FileName::ProcMacroSourceCode;
+            let expn_info = mark.expn_info().unwrap();
+            let call_site = expn_info.call_site;
+            // notify the expansion info that it is unhygienic
+            let mark = Mark::fresh(mark);
+            mark.set_expn_info(expn_info);
+            let span = call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark));
+            Ok(parse::parse_stream_from_source_str(name, src, sess, Some(span)))
+        })
+    }
+    fn token_stream_delimited(&self, span: ::Span,
+                              delimiter: ::Delimiter,
+                              delimed: Self::TokenStream)
+                              -> Self::TokenStream {
+        tokenstream::TokenTree::Delimited(span.0, tokenstream::Delimited {
+            delim: delimiter.to_internal(),
+            tts: delimed.into(),
+        }).into()
+    }
+    fn token_stream_from_token_tree(&self, tree: TokenTree) -> Self::TokenStream {
+        use syntax::parse::token::*;
+        use syntax::tokenstream::TokenTree;
+
+        let (op, kind) = match tree.kind {
+            TokenNode::Op(op, kind) => (op, kind),
+            TokenNode::Group(..) => unreachable!(),
+            TokenNode::Term(symbol) => {
+                let ident = ast::Ident { name: symbol.0, ctxt: tree.span.0.ctxt() };
+                let token = if symbol.0.as_str().starts_with("'") {
+                    Lifetime(ident)
+                } else {
+                    Ident(ident)
+                };
+                return TokenTree::Token(tree.span.0, token).into();
+            }
+            TokenNode::Literal(token) => return TokenTree::Token(tree.span.0, token.0).into(),
+        };
+
+        let token = match op {
+            '=' => Eq,
+            '<' => Lt,
+            '>' => Gt,
+            '!' => Not,
+            '~' => Tilde,
+            '+' => BinOp(Plus),
+            '-' => BinOp(Minus),
+            '*' => BinOp(Star),
+            '/' => BinOp(Slash),
+            '%' => BinOp(Percent),
+            '^' => BinOp(Caret),
+            '&' => BinOp(And),
+            '|' => BinOp(Or),
+            '@' => At,
+            '.' => Dot,
+            ',' => Comma,
+            ';' => Semi,
+            ':' => Colon,
+            '#' => Pound,
+            '$' => Dollar,
+            '?' => Question,
+            _ => panic!("unsupported character {}", op),
+        };
+
+        let tree = TokenTree::Token(tree.span.0, token);
+        match kind {
+            Spacing::Alone => tree.into(),
+            Spacing::Joint => tree.joint(),
+        }
+    }
+    fn token_stream_to_token_tree(&self, stream: Self::TokenStream)
+                                  -> Result<(::TokenTree, Option<Self::TokenStream>),
+                                            (::Span, (::Delimiter, Self::TokenStream))> {
+        use syntax::parse::token::*;
+
+        let mut next = None;
+
+        let (tree, is_joint) = stream.as_tree();
+        let (mut span, token) = match tree {
+            tokenstream::TokenTree::Delimited(span, delimed) => {
+                let delimiter = Delimiter::from_internal(delimed.delim);
+                return Err((Span(span), (delimiter, delimed.tts.into())));
+            }
+            tokenstream::TokenTree::Token(span, token) => (span, token),
+        };
+
+        let op_kind = if is_joint { Spacing::Joint } else { Spacing::Alone };
+        macro_rules! op {
+            ($op:expr) => { TokenNode::Op($op, op_kind) }
+        }
+
+        macro_rules! joint {
+            ($first:expr, $rest:expr) => {
+                joint($first, $rest, is_joint, &mut span, &mut next)
+            }
+        }
+
+        fn joint(first: char, rest: Token, is_joint: bool, span: &mut syntax_pos::Span,
+                next: &mut Option<tokenstream::TokenStream>)
+                -> TokenNode {
+            let (first_span, rest_span) = (*span, *span);
+            *span = first_span;
+            let tree = tokenstream::TokenTree::Token(rest_span, rest);
+            *next = Some(if is_joint { tree.joint() } else { tree.into() });
+            TokenNode::Op(first, Spacing::Joint)
+        }
+
+        let kind = match token {
+            Eq => op!('='),
+            Lt => op!('<'),
+            Le => joint!('<', Eq),
+            EqEq => joint!('=', Eq),
+            Ne => joint!('!', Eq),
+            Ge => joint!('>', Eq),
+            Gt => op!('>'),
+            AndAnd => joint!('&', BinOp(And)),
+            OrOr => joint!('|', BinOp(Or)),
+            Not => op!('!'),
+            Tilde => op!('~'),
+            BinOp(Plus) => op!('+'),
+            BinOp(Minus) => op!('-'),
+            BinOp(Star) => op!('*'),
+            BinOp(Slash) => op!('/'),
+            BinOp(Percent) => op!('%'),
+            BinOp(Caret) => op!('^'),
+            BinOp(And) => op!('&'),
+            BinOp(Or) => op!('|'),
+            BinOp(Shl) => joint!('<', Lt),
+            BinOp(Shr) => joint!('>', Gt),
+            BinOpEq(Plus) => joint!('+', Eq),
+            BinOpEq(Minus) => joint!('-', Eq),
+            BinOpEq(Star) => joint!('*', Eq),
+            BinOpEq(Slash) => joint!('/', Eq),
+            BinOpEq(Percent) => joint!('%', Eq),
+            BinOpEq(Caret) => joint!('^', Eq),
+            BinOpEq(And) => joint!('&', Eq),
+            BinOpEq(Or) => joint!('|', Eq),
+            BinOpEq(Shl) => joint!('<', Le),
+            BinOpEq(Shr) => joint!('>', Ge),
+            At => op!('@'),
+            Dot => op!('.'),
+            DotDot => joint!('.', Dot),
+            DotDotDot => joint!('.', DotDot),
+            DotDotEq => joint!('.', DotEq),
+            Comma => op!(','),
+            Semi => op!(';'),
+            Colon => op!(':'),
+            ModSep => joint!(':', Colon),
+            RArrow => joint!('-', Gt),
+            LArrow => joint!('<', BinOp(Minus)),
+            FatArrow => joint!('=', Gt),
+            Pound => op!('#'),
+            Dollar => op!('$'),
+            Question => op!('?'),
+
+            Ident(ident) | Lifetime(ident) => TokenNode::Term(Term(ident.name)),
+            Literal(..) | DocComment(..) => TokenNode::Literal(::Literal(token)),
+
+            Interpolated(_) => {
+                return Err((Span(span), __internal::with_sess(|(sess, _)| {
+                    let tts = token.interpolated_to_tokenstream(sess, span);
+                    (Delimiter::None, tts)
+                })));
+            }
+
+            DotEq => joint!('.', Eq),
+            OpenDelim(..) | CloseDelim(..) => unreachable!(),
+            Whitespace | Comment | Shebang(..) | Eof => unreachable!(),
+        };
+
+        Ok((TokenTree { span: Span(span), kind: kind }, next))
+    }
+    fn token_stream_trees(&self, stream: Self::TokenStream) -> Self::TokenCursor {
+        stream.trees()
+    }
+
+    fn token_stream_builder_new(&self) -> Self::TokenStreamBuilder {
+        tokenstream::TokenStreamBuilder::new()
+    }
+    fn token_stream_builder_push(&self, builder: &mut Self::TokenStreamBuilder,
+                                 stream: Self::TokenStream) {
+        builder.push(stream);
+    }
+    fn token_stream_builder_build(&self, builder: Self::TokenStreamBuilder)
+                                  -> Self::TokenStream {
+        builder.build()
+    }
+
+    fn token_cursor_next(&self, cursor: &mut Self::TokenCursor) -> Option<Self::TokenStream> {
+        while let Some(stream) = cursor.next_as_stream() {
+            let (tree, _) = stream.clone().as_tree();
+            let span = tree.span();
+            if span != DUMMY_SP {
+                return Some(stream);
+            }
+            let nested_stream = match tree {
+                tokenstream::TokenTree::Delimited(_, tokenstream::Delimited {
+                    delim: token::NoDelim,
+                    tts
+                }) => tts.into(),
+                tokenstream::TokenTree::Token(_, token @ token::Interpolated(_)) => {
+                    __internal::with_sess(|(sess, _)| {
+                        token.interpolated_to_tokenstream(sess, span)
+                    })
+                }
+                _ => return Some(stream)
+            };
+            cursor.insert(nested_stream);
+        }
+        None
+    }
+}

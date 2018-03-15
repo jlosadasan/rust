@@ -16,11 +16,7 @@
 
 use {Delimiter, Literal, Spacing, Span, Term, TokenNode, TokenStream, TokenTree};
 
-use syntax::ext::base::{ExtCtxt, ProcMacro};
 use syntax::parse::token;
-use syntax::tokenstream;
-
-pub struct Quoter;
 
 pub fn unquote<T: Into<TokenStream> + Clone>(tokens: &T) -> TokenStream {
     T::into(tokens.clone())
@@ -65,18 +61,6 @@ macro_rules! quote {
             $(TokenStream::from(quote_tree!($t)),)*
         ].iter().cloned().collect::<TokenStream>()
     };
-}
-
-impl ProcMacro for Quoter {
-    fn expand<'cx>(&self, cx: &'cx mut ExtCtxt,
-                   _: ::syntax_pos::Span,
-                   stream: tokenstream::TokenStream)
-                   -> tokenstream::TokenStream {
-        let mut info = cx.current_expansion.mark.expn_info().unwrap();
-        info.callee.allow_internal_unstable = true;
-        cx.current_expansion.mark.set_expn_info(info);
-        ::__internal::set_sess(cx, || TokenStream(stream).quote().0)
-    }
 }
 
 impl<T: Quote> Quote for Option<T> {

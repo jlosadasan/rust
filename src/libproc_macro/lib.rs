@@ -39,12 +39,24 @@
 #![feature(staged_api)]
 #![feature(lang_items)]
 #![feature(optin_builtin_traits)]
+#![feature(box_into_raw_non_null)]
+#![feature(nonnull_cast)]
 
 #[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
 extern crate rustc_errors;
 extern crate rustc_data_structures;
+
+#[unstable(feature = "proc_macro_internals", issue = "27812")]
+#[doc(hidden)]
+pub mod bridge;
+
+use bridge::{Frontend, FrontendInterface};
+
+#[unstable(feature = "proc_macro_internals", issue = "27812")]
+#[doc(hidden)]
+pub mod rustc;
 
 mod diagnostic;
 
@@ -55,14 +67,10 @@ use std::{ascii, fmt, iter};
 use rustc_data_structures::sync::Lrc;
 use std::str::FromStr;
 
-use syntax::ast;
-use syntax::errors::DiagnosticBuilder;
-use syntax::parse::{self, token};
+use syntax::parse::token;
 use syntax::symbol::Symbol;
-use syntax::tokenstream;
 use syntax_pos::DUMMY_SP;
 use syntax_pos::{FileMap, Pos, SyntaxContext, FileName};
-use syntax_pos::hygiene::Mark;
 
 /// The main type provided by this crate, representing an abstract stream of
 /// tokens.
@@ -75,7 +83,7 @@ use syntax_pos::hygiene::Mark;
 /// time!
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 #[derive(Clone, Debug)]
-pub struct TokenStream(tokenstream::TokenStream);
+pub struct TokenStream(bridge::TokenStream);
 
 /// Error returned from `TokenStream::from_str`.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
@@ -89,18 +97,7 @@ impl FromStr for TokenStream {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<TokenStream, LexError> {
-        __internal::with_sess(|(sess, mark)| {
-            let src = src.to_string();
-            let name = FileName::ProcMacroSourceCode;
-            let expn_info = mark.expn_info().unwrap();
-            let call_site = expn_info.call_site;
-            // notify the expansion info that it is unhygienic
-            let mark = Mark::fresh(mark);
-            mark.set_expn_info(expn_info);
-            let span = call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark));
-            let stream = parse::parse_stream_from_source_str(name, src, sess, Some(span));
-            Ok(__internal::token_stream_wrap(stream))
-        })
+        Frontend.token_stream_from_str(src).map(TokenStream)
     }
 }
 
@@ -128,7 +125,12 @@ mod quote;
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl From<TokenTree> for TokenStream {
     fn from(tree: TokenTree) -> TokenStream {
-        TokenStream(tree.to_internal())
+        TokenStream(match tree.kind {
+            TokenNode::Group(delimiter, tokens) => {
+                Frontend.token_stream_delimited(tree.span, delimiter, tokens.0)
+            }
+            _ => Frontend.token_stream_from_token_tree(tree)
+        })
     }
 }
 
@@ -142,11 +144,11 @@ impl From<TokenNode> for TokenStream {
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl<T: Into<TokenStream>> iter::FromIterator<T> for TokenStream {
     fn from_iter<I: IntoIterator<Item = T>>(streams: I) -> Self {
-        let mut builder = tokenstream::TokenStreamBuilder::new();
+        let mut builder = Frontend.token_stream_builder_new();
         for stream in streams {
-            builder.push(stream.into().0);
+            Frontend.token_stream_builder_push(&mut builder, stream.into().0);
         }
-        TokenStream(builder.build())
+        TokenStream(Frontend.token_stream_builder_build(builder))
     }
 }
 
@@ -156,7 +158,10 @@ impl IntoIterator for TokenStream {
     type IntoIter = TokenTreeIter;
 
     fn into_iter(self) -> TokenTreeIter {
-        TokenTreeIter { cursor: self.0.trees(), next: None }
+        TokenTreeIter {
+            cursor: Frontend.token_stream_trees(self.0),
+            next: None,
+        }
     }
 }
 
@@ -164,13 +169,13 @@ impl TokenStream {
     /// Returns an empty `TokenStream`.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn empty() -> TokenStream {
-        TokenStream(tokenstream::TokenStream::empty())
+        TokenStream(Frontend.token_stream_empty())
     }
 
     /// Checks if this `TokenStream` is empty.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        Frontend.token_stream_is_empty(&self.0)
     }
 }
 
@@ -553,8 +558,8 @@ impl Literal {
 #[derive(Clone)]
 #[unstable(feature = "proc_macro", issue = "38356")]
 pub struct TokenTreeIter {
-    cursor: tokenstream::Cursor,
-    next: Option<tokenstream::TokenStream>,
+    cursor: bridge::TokenCursor,
+    next: Option<bridge::TokenStream>,
 }
 
 #[unstable(feature = "proc_macro", issue = "38356")]
@@ -562,194 +567,20 @@ impl Iterator for TokenTreeIter {
     type Item = TokenTree;
 
     fn next(&mut self) -> Option<TokenTree> {
-        loop {
-            let next =
-                unwrap_or!(self.next.take().or_else(|| self.cursor.next_as_stream()), return None);
-            let tree = TokenTree::from_internal(next, &mut self.next);
-            if tree.span.0 == DUMMY_SP {
-                if let TokenNode::Group(Delimiter::None, stream) = tree.kind {
-                    self.cursor.insert(stream.0);
-                    continue
-                }
-            }
-            return Some(tree);
-        }
-    }
-}
-
-impl Delimiter {
-    fn from_internal(delim: token::DelimToken) -> Delimiter {
-        match delim {
-            token::Paren => Delimiter::Parenthesis,
-            token::Brace => Delimiter::Brace,
-            token::Bracket => Delimiter::Bracket,
-            token::NoDelim => Delimiter::None,
-        }
-    }
-
-    fn to_internal(self) -> token::DelimToken {
-        match self {
-            Delimiter::Parenthesis => token::Paren,
-            Delimiter::Brace => token::Brace,
-            Delimiter::Bracket => token::Bracket,
-            Delimiter::None => token::NoDelim,
-        }
-    }
-}
-
-impl TokenTree {
-    fn from_internal(stream: tokenstream::TokenStream, next: &mut Option<tokenstream::TokenStream>)
-                -> TokenTree {
-        use syntax::parse::token::*;
-
-        let (tree, is_joint) = stream.as_tree();
-        let (mut span, token) = match tree {
-            tokenstream::TokenTree::Token(span, token) => (span, token),
-            tokenstream::TokenTree::Delimited(span, delimed) => {
-                let delimiter = Delimiter::from_internal(delimed.delim);
-                return TokenTree {
-                    span: Span(span),
-                    kind: TokenNode::Group(delimiter, TokenStream(delimed.tts.into())),
-                };
+        let next = unwrap_or!(self.next.take().or_else(|| {
+            Frontend.token_cursor_next(&mut self.cursor)
+        }), return None);
+        let (tree, next) = match Frontend.token_stream_to_token_tree(next) {
+            Ok((tree, next)) => (tree, next),
+            Err((span, (delimiter, delimed))) => {
+                (TokenTree {
+                    span,
+                    kind: TokenNode::Group(delimiter, TokenStream(delimed)),
+                }, None)
             }
         };
-
-        let op_kind = if is_joint { Spacing::Joint } else { Spacing::Alone };
-        macro_rules! op {
-            ($op:expr) => { TokenNode::Op($op, op_kind) }
-        }
-
-        macro_rules! joint {
-            ($first:expr, $rest:expr) => { joint($first, $rest, is_joint, &mut span, next) }
-        }
-
-        fn joint(first: char, rest: Token, is_joint: bool, span: &mut syntax_pos::Span,
-                 next: &mut Option<tokenstream::TokenStream>)
-                 -> TokenNode {
-            let (first_span, rest_span) = (*span, *span);
-            *span = first_span;
-            let tree = tokenstream::TokenTree::Token(rest_span, rest);
-            *next = Some(if is_joint { tree.joint() } else { tree.into() });
-            TokenNode::Op(first, Spacing::Joint)
-        }
-
-        let kind = match token {
-            Eq => op!('='),
-            Lt => op!('<'),
-            Le => joint!('<', Eq),
-            EqEq => joint!('=', Eq),
-            Ne => joint!('!', Eq),
-            Ge => joint!('>', Eq),
-            Gt => op!('>'),
-            AndAnd => joint!('&', BinOp(And)),
-            OrOr => joint!('|', BinOp(Or)),
-            Not => op!('!'),
-            Tilde => op!('~'),
-            BinOp(Plus) => op!('+'),
-            BinOp(Minus) => op!('-'),
-            BinOp(Star) => op!('*'),
-            BinOp(Slash) => op!('/'),
-            BinOp(Percent) => op!('%'),
-            BinOp(Caret) => op!('^'),
-            BinOp(And) => op!('&'),
-            BinOp(Or) => op!('|'),
-            BinOp(Shl) => joint!('<', Lt),
-            BinOp(Shr) => joint!('>', Gt),
-            BinOpEq(Plus) => joint!('+', Eq),
-            BinOpEq(Minus) => joint!('-', Eq),
-            BinOpEq(Star) => joint!('*', Eq),
-            BinOpEq(Slash) => joint!('/', Eq),
-            BinOpEq(Percent) => joint!('%', Eq),
-            BinOpEq(Caret) => joint!('^', Eq),
-            BinOpEq(And) => joint!('&', Eq),
-            BinOpEq(Or) => joint!('|', Eq),
-            BinOpEq(Shl) => joint!('<', Le),
-            BinOpEq(Shr) => joint!('>', Ge),
-            At => op!('@'),
-            Dot => op!('.'),
-            DotDot => joint!('.', Dot),
-            DotDotDot => joint!('.', DotDot),
-            DotDotEq => joint!('.', DotEq),
-            Comma => op!(','),
-            Semi => op!(';'),
-            Colon => op!(':'),
-            ModSep => joint!(':', Colon),
-            RArrow => joint!('-', Gt),
-            LArrow => joint!('<', BinOp(Minus)),
-            FatArrow => joint!('=', Gt),
-            Pound => op!('#'),
-            Dollar => op!('$'),
-            Question => op!('?'),
-
-            Ident(ident) | Lifetime(ident) => TokenNode::Term(Term(ident.name)),
-            Literal(..) | DocComment(..) => TokenNode::Literal(self::Literal(token)),
-
-            Interpolated(_) => {
-                __internal::with_sess(|(sess, _)| {
-                    let tts = token.interpolated_to_tokenstream(sess, span);
-                    TokenNode::Group(Delimiter::None, TokenStream(tts))
-                })
-            }
-
-            DotEq => joint!('.', Eq),
-            OpenDelim(..) | CloseDelim(..) => unreachable!(),
-            Whitespace | Comment | Shebang(..) | Eof => unreachable!(),
-        };
-
-        TokenTree { span: Span(span), kind: kind }
-    }
-
-    fn to_internal(self) -> tokenstream::TokenStream {
-        use syntax::parse::token::*;
-        use syntax::tokenstream::{TokenTree, Delimited};
-
-        let (op, kind) = match self.kind {
-            TokenNode::Op(op, kind) => (op, kind),
-            TokenNode::Group(delimiter, tokens) => {
-                return TokenTree::Delimited(self.span.0, Delimited {
-                    delim: delimiter.to_internal(),
-                    tts: tokens.0.into(),
-                }).into();
-            },
-            TokenNode::Term(symbol) => {
-                let ident = ast::Ident { name: symbol.0, ctxt: self.span.0.ctxt() };
-                let token =
-                    if symbol.0.as_str().starts_with("'") { Lifetime(ident) } else { Ident(ident) };
-                return TokenTree::Token(self.span.0, token).into();
-            }
-            TokenNode::Literal(token) => return TokenTree::Token(self.span.0, token.0).into(),
-        };
-
-        let token = match op {
-            '=' => Eq,
-            '<' => Lt,
-            '>' => Gt,
-            '!' => Not,
-            '~' => Tilde,
-            '+' => BinOp(Plus),
-            '-' => BinOp(Minus),
-            '*' => BinOp(Star),
-            '/' => BinOp(Slash),
-            '%' => BinOp(Percent),
-            '^' => BinOp(Caret),
-            '&' => BinOp(And),
-            '|' => BinOp(Or),
-            '@' => At,
-            '.' => Dot,
-            ',' => Comma,
-            ';' => Semi,
-            ':' => Colon,
-            '#' => Pound,
-            '$' => Dollar,
-            '?' => Question,
-            _ => panic!("unsupported character {}", op),
-        };
-
-        let tree = TokenTree::Token(self.span.0, token);
-        match kind {
-            Spacing::Alone => tree.into(),
-            Spacing::Joint => tree.joint(),
-        }
+        self.next = next;
+        Some(tree)
     }
 }
 
@@ -765,64 +596,26 @@ impl TokenTree {
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
 #[doc(hidden)]
 pub mod __internal {
-    pub use quote::{LiteralKind, Quoter, unquote};
+    pub use bridge::{Expand1, Expand2, Registry};
+    pub use quote::{LiteralKind, unquote};
 
     use std::cell::Cell;
 
-    use syntax::ast;
+    use syntax::errors::DiagnosticBuilder;
     use syntax::ext::base::ExtCtxt;
     use syntax::ext::hygiene::Mark;
-    use syntax::ptr::P;
-    use syntax::parse::{self, ParseSess};
-    use syntax::parse::token::{self, Token};
-    use syntax::tokenstream;
-    use syntax_pos::{BytePos, Loc, DUMMY_SP};
+    use syntax::parse::ParseSess;
+    use syntax_pos::{BytePos, Loc};
 
-    use super::{TokenStream, LexError};
+    use super::LexError;
 
     pub fn lookup_char_pos(pos: BytePos) -> Loc {
         with_sess(|(sess, _)| sess.codemap().lookup_char_pos(pos))
     }
 
-    pub fn new_token_stream(item: P<ast::Item>) -> TokenStream {
-        let token = Token::interpolated(token::NtItem(item));
-        TokenStream(tokenstream::TokenTree::Token(DUMMY_SP, token).into())
-    }
-
-    pub fn token_stream_wrap(inner: tokenstream::TokenStream) -> TokenStream {
-        TokenStream(inner)
-    }
-
-    pub fn token_stream_parse_items(stream: TokenStream) -> Result<Vec<P<ast::Item>>, LexError> {
-        with_sess(move |(sess, _)| {
-            let mut parser = parse::stream_to_parser(sess, stream.0);
-            let mut items = Vec::new();
-
-            while let Some(item) = try!(parser.parse_item().map_err(super::parse_to_lex_err)) {
-                items.push(item)
-            }
-
-            Ok(items)
-        })
-    }
-
-    pub fn token_stream_inner(stream: TokenStream) -> tokenstream::TokenStream {
-        stream.0
-    }
-
-    pub trait Registry {
-        fn register_custom_derive(&mut self,
-                                  trait_name: &str,
-                                  expand: fn(TokenStream) -> TokenStream,
-                                  attributes: &[&'static str]);
-
-        fn register_attr_proc_macro(&mut self,
-                                    name: &str,
-                                    expand: fn(TokenStream, TokenStream) -> TokenStream);
-
-        fn register_bang_proc_macro(&mut self,
-                                    name: &str,
-                                    expand: fn(TokenStream) -> TokenStream);
+    pub fn parse_to_lex_err(mut err: DiagnosticBuilder) -> LexError {
+        err.cancel();
+        LexError { _inner: () }
     }
 
     // Emulate scoped_thread_local!() here essentially
@@ -845,6 +638,7 @@ pub mod __internal {
         CURRENT_SESS.with(|p| {
             let _reset = Reset { prev: p.get() };
             p.set((cx.parse_sess, cx.current_expansion.mark));
+
             f()
         })
     }
@@ -863,9 +657,4 @@ pub mod __internal {
                                  before set_parse_sess()!");
         f(unsafe { (&*p.0, p.1) })
     }
-}
-
-fn parse_to_lex_err(mut err: DiagnosticBuilder) -> LexError {
-    err.cancel();
-    LexError { _inner: () }
 }

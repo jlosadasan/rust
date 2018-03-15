@@ -11,12 +11,15 @@
 use std::panic;
 
 use errors::FatalError;
-use proc_macro::{TokenStream, __internal};
 use syntax::ast::{self, ItemKind, Attribute, Mac};
 use syntax::attr::{mark_used, mark_known};
 use syntax::codemap::Span;
 use syntax::ext::base::*;
+use syntax::parse;
+use syntax::parse::token::{self, Token};
+use syntax::tokenstream;
 use syntax::visit::Visitor;
+use syntax_pos::DUMMY_SP;
 
 struct MarkAttrs<'a>(&'a [ast::Name]);
 
@@ -34,12 +37,12 @@ impl<'a> Visitor<'a> for MarkAttrs<'a> {
 }
 
 pub struct ProcMacroDerive {
-    inner: fn(TokenStream) -> TokenStream,
+    inner: ::proc_macro::bridge::Expand1,
     attrs: Vec<ast::Name>,
 }
 
 impl ProcMacroDerive {
-    pub fn new(inner: fn(TokenStream) -> TokenStream, attrs: Vec<ast::Name>) -> ProcMacroDerive {
+    pub fn new(inner: ::proc_macro::bridge::Expand1, attrs: Vec<ast::Name>) -> ProcMacroDerive {
         ProcMacroDerive { inner: inner, attrs: attrs }
     }
 }
@@ -73,11 +76,14 @@ impl MultiItemModifier for ProcMacroDerive {
         // Mark attributes as known, and used.
         MarkAttrs(&self.attrs).visit_item(&item);
 
-        let input = __internal::new_token_stream(ecx.resolver.eliminate_crate_var(item.clone()));
-        let res = __internal::set_sess(ecx, || {
-            let inner = self.inner;
-            panic::catch_unwind(panic::AssertUnwindSafe(|| inner(input)))
-        });
+        let item = ecx.resolver.eliminate_crate_var(item.clone());
+        let token = Token::interpolated(token::NtItem(item));
+        let input = tokenstream::TokenTree::Token(DUMMY_SP, token).into();
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            ::proc_macro::__internal::set_sess(ecx, || {
+                self.inner.run(::proc_macro::rustc::Rustc, input)
+            })
+        }));
 
         let stream = match res {
             Ok(stream) => stream,
@@ -97,21 +103,32 @@ impl MultiItemModifier for ProcMacroDerive {
         };
 
         let error_count_before = ecx.parse_sess.span_diagnostic.err_count();
-        __internal::set_sess(ecx, || {
-            let msg = "proc-macro derive produced unparseable tokens";
-            match __internal::token_stream_parse_items(stream) {
-                // fail if there have been errors emitted
-                Ok(_) if ecx.parse_sess.span_diagnostic.err_count() > error_count_before => {
-                    ecx.struct_span_fatal(span, msg).emit();
-                    FatalError.raise();
+        let msg = "proc-macro derive produced unparseable tokens";
+
+        let mut parser = parse::stream_to_parser(ecx.parse_sess, stream);
+        let mut items = vec![];
+
+        loop {
+            match parser.parse_item().map_err(::proc_macro::__internal::parse_to_lex_err) {
+                Ok(None) => break,
+                Ok(Some(item)) => {
+                    items.push(Annotatable::Item(item))
                 }
-                Ok(new_items) => new_items.into_iter().map(Annotatable::Item).collect(),
                 Err(_) => {
                     // FIXME: handle this better
                     ecx.struct_span_fatal(span, msg).emit();
                     FatalError.raise();
                 }
             }
-        })
+        }
+
+
+        // fail if there have been errors emitted
+        if ecx.parse_sess.span_diagnostic.err_count() > error_count_before {
+            ecx.struct_span_fatal(span, msg).emit();
+            FatalError.raise();
+        }
+
+        items
     }
 }
