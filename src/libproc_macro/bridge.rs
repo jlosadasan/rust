@@ -21,6 +21,7 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::path::PathBuf;
 use std::ptr::NonNull;
 
 use self::storage::{FromConcrete, ToConcrete};
@@ -195,6 +196,8 @@ storage_concrete_passthrough! {
     [] ::Span,
     [] ::Delimiter,
     [] ::LexError,
+
+    [] PathBuf,
     // NOTE(eddyb) this will need some `extern "C" fn write`.
     ['a, 'b] &'a mut fmt::Formatter<'b>,
     [] fmt::Error
@@ -243,6 +246,17 @@ macro_rules! each_frontend_method {
         });
         $meth!(fn token_cursor_next(&self, cursor: &mut Self::TokenCursor)
                                     -> Option<Self::TokenStream>;);
+
+        $meth!(fn source_file_cleanup(&self, _file: Self::SourceFile) -> () {});
+        $meth!(fn source_file_clone(&self, file: &Self::SourceFile) -> Self::SourceFile {
+            file.clone()
+        });
+        $meth!(fn source_file_eq(&self, file1: &Self::SourceFile,
+                                 file2: &Self::SourceFile) -> bool;);
+        $meth!(fn source_file_path(&self, file: &Self::SourceFile) -> PathBuf;);
+        $meth!(fn source_file_is_real(&self, file: &Self::SourceFile) -> bool;);
+
+        $meth!(fn span_source_file(&self, span: ::Span) -> Self::SourceFile;);
     }
 }
 
@@ -253,6 +267,7 @@ pub trait FrontendInterface {
     type TokenStream: 'static + Clone + fmt::Debug + fmt::Display;
     type TokenStreamBuilder: 'static;
     type TokenCursor: 'static + Clone;
+    type SourceFile: 'static + Clone;
     each_frontend_method!(define_frontend_trait_method);
 }
 
@@ -310,6 +325,9 @@ define_boxed! {
     },
     TokenCursor {
         cleanup: token_cursor_cleanup
+    },
+    SourceFile {
+        cleanup: source_file_cleanup
     }
 }
 
@@ -337,6 +355,12 @@ impl Clone for TokenCursor {
     }
 }
 
+impl Clone for SourceFile {
+    fn clone(&self) -> Self {
+        Frontend.source_file_clone(self)
+    }
+}
+
 pub(crate) struct Frontend;
 
 macro_rules! define_frontend_current_method {
@@ -351,6 +375,7 @@ impl FrontendInterface for Frontend {
     type TokenStream = TokenStream;
     type TokenStreamBuilder = TokenStreamBuilder;
     type TokenCursor = TokenCursor;
+    type SourceFile = SourceFile;
     each_frontend_method!(define_frontend_current_method);
 }
 
@@ -359,6 +384,7 @@ type CurrentFrontend<'a> = FrontendInterface<
     TokenStream = TokenStream,
     TokenStreamBuilder = TokenStreamBuilder,
     TokenCursor = TokenCursor,
+    SourceFile = SourceFile,
 > + 'a;
 
 // Emulate scoped_thread_local!() here essentially
@@ -421,6 +447,7 @@ fn erase_concrete_frontend<F, G, R>(ng: extern "C" fn() -> generation::Generatio
         type TokenStream = TokenStream;
         type TokenStreamBuilder = TokenStreamBuilder;
         type TokenCursor = TokenCursor;
+        type SourceFile = SourceFile;
         each_frontend_method!(define_frontend_erase_concrete_method);
     }
 

@@ -10,7 +10,9 @@
 
 use {__internal, Delimiter, Spacing, Span, Term, TokenNode, TokenTree};
 
-use syntax_pos::{self, SyntaxContext, FileName};
+use rustc_data_structures::sync::Lrc;
+use std::path::PathBuf;
+use syntax_pos::{self, SyntaxContext, FileMap, FileName};
 use syntax_pos::hygiene::Mark;
 use syntax::ast;
 use syntax::ext::base::{ExtCtxt, ProcMacro};
@@ -58,7 +60,7 @@ impl ::bridge::FrontendInterface for Rustc {
     type TokenStream = tokenstream::TokenStream;
     type TokenStreamBuilder = tokenstream::TokenStreamBuilder;
     type TokenCursor = tokenstream::Cursor;
-
+    type SourceFile = Lrc<FileMap>;
 
     fn token_stream_empty(&self) -> Self::TokenStream {
         tokenstream::TokenStream::empty()
@@ -278,5 +280,22 @@ impl ::bridge::FrontendInterface for Rustc {
             cursor.insert(nested_stream);
         }
         None
+    }
+
+    fn source_file_eq(&self, file1: &Self::SourceFile, file2: &Self::SourceFile) -> bool {
+        Lrc::ptr_eq(file1, file2)
+    }
+    fn source_file_path(&self, file: &Self::SourceFile) -> PathBuf {
+        match file.name {
+            FileName::Real(ref path) => path.clone(),
+            _ => PathBuf::from(file.name.to_string())
+        }
+    }
+    fn source_file_is_real(&self, file: &Self::SourceFile) -> bool {
+        file.is_real_file()
+    }
+
+    fn span_source_file(&self, span: ::Span) -> Self::SourceFile {
+        ::__internal::lookup_char_pos(span.0.lo()).file
     }
 }
