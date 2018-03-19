@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use {__internal, Delimiter, Spacing, Term, TokenNode};
+use {Delimiter, Spacing, Term, TokenNode};
 
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{Diagnostic, DiagnosticBuilder, Level};
@@ -17,7 +17,7 @@ use syntax_pos::{self, SyntaxContext, FileMap, FileName, MultiSpan, Pos, DUMMY_S
 use syntax_pos::hygiene::Mark;
 use syntax::ast;
 use syntax::ext::base::{ExtCtxt, ProcMacro};
-use syntax::parse::{self, token};
+use syntax::parse::{self, token, ParseSess};
 use syntax::tokenstream;
 
 pub struct Quoter;
@@ -27,12 +27,13 @@ impl ProcMacro for Quoter {
                 _: syntax_pos::Span,
                 stream: tokenstream::TokenStream)
                 -> tokenstream::TokenStream {
-        let expand_quoter = ::bridge::Expand1::new(&::quote::Quote::quote);
+        let expand_quoter = ::bridge::Expand1::new(&::quote_token_stream);
 
         let mut info = cx.current_expansion.mark.expn_info().unwrap();
         info.callee.allow_internal_unstable = true;
         cx.current_expansion.mark.set_expn_info(info);
-        __internal::set_sess(cx, || expand_quoter.run(Rustc, stream))
+
+        expand_quoter.run(Rustc::new(cx), stream)
     }
 }
 
@@ -68,8 +69,21 @@ impl Delimiter {
     }
 }
 
-pub struct Rustc;
-impl ::bridge::FrontendInterface for Rustc {
+pub struct Rustc<'a> {
+    sess: &'a ParseSess,
+    mark: Mark,
+}
+
+impl<'a> Rustc<'a> {
+    pub fn new(cx: &'a ExtCtxt) -> Self {
+        Rustc {
+            sess: cx.parse_sess,
+            mark: cx.current_expansion.mark
+        }
+    }
+}
+
+impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
     type TokenStream = tokenstream::TokenStream;
     type TokenStreamBuilder = tokenstream::TokenStreamBuilder;
     type TokenCursor = tokenstream::Cursor;
@@ -84,17 +98,15 @@ impl ::bridge::FrontendInterface for Rustc {
         stream.is_empty()
     }
     fn token_stream_from_str(&self, src: &str) -> Result<Self::TokenStream, ::LexError> {
-        ::__internal::with_sess(|(sess, mark)| {
-            let src = src.to_string();
-            let name = FileName::ProcMacroSourceCode;
-            let expn_info = mark.expn_info().unwrap();
-            let call_site = expn_info.call_site;
-            // notify the expansion info that it is unhygienic
-            let mark = Mark::fresh(mark);
-            mark.set_expn_info(expn_info);
-            let span = call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark));
-            Ok(parse::parse_stream_from_source_str(name, src, sess, Some(span)))
-        })
+        let src = src.to_string();
+        let name = FileName::ProcMacroSourceCode;
+        let expn_info = self.mark.expn_info().unwrap();
+        let call_site = expn_info.call_site;
+        // notify the expansion info that it is unhygienic
+        let mark = Mark::fresh(self.mark);
+        mark.set_expn_info(expn_info);
+        let span = call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark));
+        Ok(parse::parse_stream_from_source_str(name, src, self.sess, Some(span)))
     }
     fn token_stream_delimited(&self, span: Self::Span,
                               delimiter: ::Delimiter,
@@ -246,10 +258,8 @@ impl ::bridge::FrontendInterface for Rustc {
             Literal(..) | DocComment(..) => TokenNode::Literal(::Literal(token)),
 
             Interpolated(_) => {
-                return (span, Err(__internal::with_sess(|(sess, _)| {
-                    let tts = token.interpolated_to_tokenstream(sess, span);
-                    (Delimiter::None, tts)
-                })));
+                let tts = token.interpolated_to_tokenstream(self.sess, span);
+                return (span, Err((Delimiter::None, tts)));
             }
 
             DotEq => joint!('.', Eq),
@@ -288,9 +298,7 @@ impl ::bridge::FrontendInterface for Rustc {
                     tts
                 }) => tts.into(),
                 tokenstream::TokenTree::Token(_, token @ token::Interpolated(_)) => {
-                    __internal::with_sess(|(sess, _)| {
-                        token.interpolated_to_tokenstream(sess, span)
-                    })
+                    token.interpolated_to_tokenstream(self.sess, span)
                 }
                 _ => return Some(stream)
             };
@@ -329,22 +337,18 @@ impl ::bridge::FrontendInterface for Rustc {
         diagnostic.sub(level.to_internal(), msg, span, None);
     }
     fn diagnostic_emit(&self, diagnostic: Self::Diagnostic) {
-        ::__internal::with_sess(move |(sess, _)| {
-            DiagnosticBuilder::new_diagnostic(&sess.span_diagnostic, diagnostic).emit()
-        });
+        DiagnosticBuilder::new_diagnostic(&self.sess.span_diagnostic, diagnostic).emit()
     }
 
     fn span_def_site(&self) -> Self::Span {
-        ::__internal::with_sess(|(_, mark)| {
-            let call_site = mark.expn_info().unwrap().call_site;
-            call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark))
-        })
+        self.span_call_site()
+            .with_ctxt(SyntaxContext::empty().apply_mark(self.mark))
     }
     fn span_call_site(&self) -> Self::Span {
-        ::__internal::with_sess(|(_, mark)| mark.expn_info().unwrap().call_site)
+        self.mark.expn_info().unwrap().call_site
     }
     fn span_source_file(&self, span: Self::Span) -> Self::SourceFile {
-        ::__internal::lookup_char_pos(span.lo()).file
+        self.sess.codemap().lookup_char_pos(span.lo()).file
     }
     fn span_parent(&self, span: Self::Span) -> Option<Self::Span> {
         span.ctxt().outer().expn_info().map(|i| i.call_site)
@@ -353,22 +357,22 @@ impl ::bridge::FrontendInterface for Rustc {
         span.source_callsite()
     }
     fn span_start(&self, span: Self::Span) -> ::LineColumn {
-        let loc = ::__internal::lookup_char_pos(span.lo());
+        let loc = self.sess.codemap().lookup_char_pos(span.lo());
         ::LineColumn {
             line: loc.line,
             column: loc.col.to_usize()
         }
     }
     fn span_end(&self, span: Self::Span) -> ::LineColumn {
-        let loc = ::__internal::lookup_char_pos(span.hi());
+        let loc = self.sess.codemap().lookup_char_pos(span.hi());
         ::LineColumn {
             line: loc.line,
             column: loc.col.to_usize()
         }
     }
     fn span_join(&self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
-        let self_loc = ::__internal::lookup_char_pos(first.lo());
-        let other_loc = ::__internal::lookup_char_pos(second.lo());
+        let self_loc = self.sess.codemap().lookup_char_pos(first.lo());
+        let other_loc = self.sess.codemap().lookup_char_pos(second.lo());
 
         if self_loc.file.name != other_loc.file.name { return None }
 

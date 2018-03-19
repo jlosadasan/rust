@@ -47,7 +47,7 @@ lazy_static! {
 }
 
 fn panic_hook(info: &panic::PanicInfo) {
-    if !proc_macro::__internal::in_sess() {
+    if !proc_macro::bridge::has_current_frontend() {
         (*DEFAULT_HOOK)(info)
     }
 }

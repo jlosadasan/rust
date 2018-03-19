@@ -120,6 +120,13 @@ macro_rules! quote { () => {} }
 #[doc(hidden)]
 mod quote;
 
+/// Quote a `TokenStream` into a `TokenStream`.
+/// This is needed to implement a custom quoter.
+#[unstable(feature = "proc_macro", issue = "38356")]
+pub fn quote_token_stream(stream: TokenStream) -> TokenStream {
+    quote::Quote::quote(stream)
+}
+
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl From<TokenTree> for TokenStream {
     fn from(tree: TokenTree) -> TokenStream {
@@ -512,6 +519,70 @@ impl Literal {
     }
 }
 
+macro_rules! literals {
+    ($($i:ident),*; $($raw:ident),*) => {
+        #[unstable(feature = "proc_macro_internals", issue = "27812")]
+        #[doc(hidden)]
+        pub enum LiteralKind {
+            $($i,)*
+            $($raw(usize),)*
+        }
+
+        impl LiteralKind {
+            #[unstable(feature = "proc_macro_internals", issue = "27812")]
+            #[doc(hidden)]
+            pub fn with_contents_and_suffix(self, contents: Term, suffix: Option<Term>)
+                                            -> Literal {
+                let contents = contents.0;
+                let suffix = suffix.map(|t| t.0);
+                match self {
+                    $(LiteralKind::$i => {
+                        Literal(token::Literal(token::Lit::$i(contents), suffix))
+                    })*
+                    $(LiteralKind::$raw(n) => {
+                        Literal(token::Literal(token::Lit::$raw(contents, n), suffix))
+                    })*
+                }
+            }
+        }
+
+        impl Literal {
+            fn kind(&self) -> LiteralKind {
+                let lit = match self.0 {
+                    token::Literal(lit, _) => lit,
+                    _ => panic!("unsupported literal {:?}", self.0),
+                };
+
+                match lit {
+                    $(token::Lit::$i(_) => LiteralKind::$i,)*
+                    $(token::Lit::$raw(_, n) => LiteralKind::$raw(n),)*
+                }
+            }
+
+            fn contents(&self) -> Term {
+                let lit = match self.0 {
+                    token::Literal(lit, _) => lit,
+                    _ => panic!("unsupported literal {:?}", self.0),
+                };
+
+                match lit {
+                    $(token::Lit::$i(contents))|* |
+                    $(token::Lit::$raw(contents, _))|* => Term(contents)
+                }
+            }
+
+            fn suffix(&self) -> Option<Term> {
+                match self.0 {
+                    token::Literal(_, suffix) => suffix.map(Term),
+                    _ => panic!("unsupported literal {:?}", self.0),
+                }
+            }
+        }
+    }
+}
+
+literals!(Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw);
+
 /// An iterator over `TokenTree`s.
 #[derive(Clone)]
 #[unstable(feature = "proc_macro", issue = "38356")]
@@ -541,80 +612,5 @@ impl Iterator for TokenTreeIter {
             span: Span(span),
             kind
         })
-    }
-}
-
-/// Permanently unstable internal implementation details of this crate. This
-/// should not be used.
-///
-/// These methods are used by the rest of the compiler to generate instances of
-/// `TokenStream` to hand to macro definitions, as well as consume the output.
-///
-/// Note that this module is also intentionally separate from the rest of the
-/// crate. This allows the `#[unstable]` directive below to naturally apply to
-/// all of the contents.
-#[unstable(feature = "proc_macro_internals", issue = "27812")]
-#[doc(hidden)]
-pub mod __internal {
-    pub use bridge::{Expand1, Expand2, Registry};
-    pub use quote::{LiteralKind, unquote};
-
-    use std::cell::Cell;
-
-    use syntax::errors::DiagnosticBuilder;
-    use syntax::ext::base::ExtCtxt;
-    use syntax::ext::hygiene::Mark;
-    use syntax::parse::ParseSess;
-    use syntax_pos::{BytePos, Loc};
-
-    use super::LexError;
-
-    pub fn lookup_char_pos(pos: BytePos) -> Loc {
-        with_sess(|(sess, _)| sess.codemap().lookup_char_pos(pos))
-    }
-
-    pub fn parse_to_lex_err(mut err: DiagnosticBuilder) -> LexError {
-        err.cancel();
-        LexError { _inner: () }
-    }
-
-    // Emulate scoped_thread_local!() here essentially
-    thread_local! {
-        static CURRENT_SESS: Cell<(*const ParseSess, Mark)> =
-            Cell::new((0 as *const _, Mark::root()));
-    }
-
-    pub fn set_sess<F, R>(cx: &ExtCtxt, f: F) -> R
-        where F: FnOnce() -> R
-    {
-        struct Reset { prev: (*const ParseSess, Mark) }
-
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                CURRENT_SESS.with(|p| p.set(self.prev));
-            }
-        }
-
-        CURRENT_SESS.with(|p| {
-            let _reset = Reset { prev: p.get() };
-            p.set((cx.parse_sess, cx.current_expansion.mark));
-
-            f()
-        })
-    }
-
-    pub fn in_sess() -> bool
-    {
-        let p = CURRENT_SESS.with(|p| p.get());
-        !p.0.is_null()
-    }
-
-    pub fn with_sess<F, R>(f: F) -> R
-        where F: FnOnce((&ParseSess, Mark)) -> R
-    {
-        let p = CURRENT_SESS.with(|p| p.get());
-        assert!(!p.0.is_null(), "proc_macro::__internal::with_sess() called \
-                                 before set_parse_sess()!");
-        f(unsafe { (&*p.0, p.1) })
     }
 }

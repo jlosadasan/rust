@@ -348,7 +348,7 @@ impl<'a> Visitor<'a> for CollectProcMacros<'a> {
 //      mod $gensym {
 //          extern crate proc_macro;
 //
-//          use proc_macro::__internal::{Expand1, Expand2, Registry};
+//          use proc_macro::bridge::{Expand1, Expand2, Registry};
 //
 //          #[plugin_registrar]
 //          fn registrar(registrar: &mut Registry) {
@@ -382,7 +382,7 @@ fn mk_registrar(cx: &mut ExtCtxt,
                         Vec::new(),
                         ast::ItemKind::ExternCrate(None));
 
-    let __internal = Ident::from_str("__internal");
+    let bridge = Ident::from_str("bridge");
     let expand1 = Ident::from_str("Expand1");
     let expand2 = Ident::from_str("Expand2");
     let new = Ident::from_str("new");
@@ -397,7 +397,7 @@ fn mk_registrar(cx: &mut ExtCtxt,
         let expand = cx.expr_addr_of(span, expand);
         let expand_span = cd.span.with_ctxt(ctxt);
         let expand = cx.expr_call(expand_span, cx.expr_path(cx.path(expand_span, vec![
-            proc_macro, __internal, expand1, new
+            proc_macro, bridge, expand1, new
         ])), vec![expand]);
         let trait_name = cx.expr_str(cd.span, cd.trait_name);
         let attrs = cx.expr_vec_slice(
@@ -405,7 +405,7 @@ fn mk_registrar(cx: &mut ExtCtxt,
             cd.attrs.iter().map(|&s| cx.expr_str(cd.span, s)).collect::<Vec<_>>()
         );
         let registrar = cx.expr_ident(span, registrar);
-        let ufcs_path = cx.path(span, vec![proc_macro, __internal, registry,
+        let ufcs_path = cx.path(span, vec![proc_macro, bridge, registry,
                                            register_custom_derive]);
 
         cx.stmt_expr(cx.expr_call(span, cx.expr_path(ufcs_path),
@@ -419,12 +419,12 @@ fn mk_registrar(cx: &mut ExtCtxt,
         let expand = cx.expr_addr_of(span, expand);
         let expand_span = ca.span.with_ctxt(ctxt);
         let expand = cx.expr_call(expand_span, cx.expr_path(cx.path(expand_span, vec![
-            proc_macro, __internal, expand2, new
+            proc_macro, bridge, expand2, new
         ])), vec![expand]);
         let registrar = cx.expr_ident(ca.span, registrar);
 
         let ufcs_path = cx.path(span,
-                                vec![proc_macro, __internal, registry, register_attr_proc_macro]);
+                                vec![proc_macro, bridge, registry, register_attr_proc_macro]);
 
         cx.stmt_expr(cx.expr_call(span, cx.expr_path(ufcs_path),
                                   vec![registrar, name, expand]))
@@ -436,18 +436,18 @@ fn mk_registrar(cx: &mut ExtCtxt,
         let expand = cx.expr_addr_of(span, expand);
         let expand_span = cm.span.with_ctxt(ctxt);
         let expand = cx.expr_call(expand_span, cx.expr_path(cx.path(expand_span, vec![
-            proc_macro, __internal, expand1, new
+            proc_macro, bridge, expand1, new
         ])), vec![expand]);
         let registrar = cx.expr_ident(cm.span, registrar);
 
         let ufcs_path = cx.path(span,
-                                vec![proc_macro, __internal, registry, register_bang_proc_macro]);
+                                vec![proc_macro, bridge, registry, register_bang_proc_macro]);
 
         cx.stmt_expr(cx.expr_call(span, cx.expr_path(ufcs_path),
                                   vec![registrar, name, expand]))
     }));
 
-    let path = cx.path(span, vec![proc_macro, __internal, registry]);
+    let path = cx.path(span, vec![proc_macro, bridge, registry]);
     let registrar_path = cx.ty_path(path);
     let arg_ty = cx.ty_rptr(span, registrar_path, None, ast::Mutability::Mutable);
     let func = cx.item_fn(span,

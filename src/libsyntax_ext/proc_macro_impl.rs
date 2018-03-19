@@ -29,9 +29,7 @@ impl base::AttrProcMacro for AttrProcMacro {
                    annotated: TokenStream)
                    -> TokenStream {
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            ::proc_macro::__internal::set_sess(ecx, || {
-                self.inner.run(::proc_macro::rustc::Rustc, annotation, annotated)
-            })
+            self.inner.run(::proc_macro::rustc::Rustc::new(ecx), annotation, annotated)
         }));
 
         match res {
@@ -64,9 +62,7 @@ impl base::ProcMacro for BangProcMacro {
                    input: TokenStream)
                    -> TokenStream {
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            ::proc_macro::__internal::set_sess(ecx, || {
-                self.inner.run(::proc_macro::rustc::Rustc, input)
-            })
+            self.inner.run(::proc_macro::rustc::Rustc::new(ecx), input)
         }));
 
         match res {
