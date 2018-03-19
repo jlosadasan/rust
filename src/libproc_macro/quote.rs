@@ -151,35 +151,31 @@ impl Quote for Span {
     }
 }
 
-macro_rules! literals {
-    ($($i:ident),*; $($raw:ident),*) => {
-        impl Quote for LiteralKind {
-            fn quote(self) -> TokenStream {
+impl Quote for LiteralKind {
+    fn quote(self) -> TokenStream {
+        macro_rules! gen_match {
+            ($($i:ident),*; $($raw:ident),*) => {
                 match self {
-                    $(LiteralKind::$i => quote! {
-                        ::LiteralKind::$i
-                    },)*
-                    $(LiteralKind::$raw(n) => quote! {
-                        ::LiteralKind::$raw((quote n))
-                    },)*
+                    $(LiteralKind::$i => quote!(::LiteralKind::$i),)*
+                    $(LiteralKind::$raw(n) => quote!(::LiteralKind::$raw((quote n))),)*
                 }
             }
         }
 
-        impl Quote for Literal {
-            fn quote(self) -> TokenStream {
-                let kind = self.kind();
-                let contents = self.contents();
-                let suffix = self.suffix();
-                quote! {
-                    (quote kind).with_contents_and_suffix((quote contents), (quote suffix))
-                }
-            }
-        }
+        gen_match!(DocComment, Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw)
     }
 }
 
-literals!(Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw);
+
+impl Quote for Literal {
+    fn quote(self) -> TokenStream {
+        quote!(::Literal {
+            kind: (quote self.kind),
+            contents: (quote self.contents),
+            suffix: (quote self.suffix),
+        })
+    }
+}
 
 impl Quote for Delimiter {
     fn quote(self) -> TokenStream {

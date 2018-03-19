@@ -67,7 +67,6 @@ use std::{ascii, fmt, iter};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use syntax::parse::token;
 use syntax::symbol::Symbol;
 
 /// The main type provided by this crate, representing an abstract stream of
@@ -429,14 +428,39 @@ pub enum Spacing {
 }
 
 /// A literal character (`'a'`), string (`"hello"`), or number (`2.3`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[unstable(feature = "proc_macro", issue = "38356")]
-pub struct Literal(token::Token);
+pub struct Literal {
+    #[unstable(feature = "proc_macro_internals", issue = "27812")]
+    #[doc(hidden)]
+    pub kind: LiteralKind,
+
+    #[unstable(feature = "proc_macro_internals", issue = "27812")]
+    #[doc(hidden)]
+    pub contents: Term,
+
+    #[unstable(feature = "proc_macro_internals", issue = "27812")]
+    #[doc(hidden)]
+    pub suffix: Option<Term>,
+}
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+impl fmt::Debug for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&TokenTree {
+            kind: TokenNode::Literal(self.clone()),
+            span: Span::def_site()
+        }, f)
+    }
+}
 
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        TokenTree { kind: TokenNode::Literal(self.clone()), span: Span::def_site() }.fmt(f)
+        fmt::Display::fmt(&TokenTree {
+            kind: TokenNode::Literal(self.clone()),
+            span: Span::def_site()
+        }, f)
     }
 }
 
@@ -454,13 +478,20 @@ impl Literal {
     /// Integer literal
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn integer(n: i128) -> Literal {
-        Literal(token::Literal(token::Lit::Integer(Symbol::intern(&n.to_string())), None))
+        Literal {
+            kind: LiteralKind::Integer,
+            contents: Term::intern(&n.to_string()),
+            suffix: None,
+        }
     }
 
     int_literals!(u8, i8, u16, i16, u32, i32, u64, i64, usize, isize);
     fn typed_integer(n: i128, kind: &'static str) -> Literal {
-        Literal(token::Literal(token::Lit::Integer(Symbol::intern(&n.to_string())),
-                               Some(Symbol::intern(kind))))
+        Literal {
+            kind: LiteralKind::Integer,
+            contents: Term::intern(&n.to_string()),
+            suffix: Some(Term::intern(kind)),
+        }
     }
 
     /// Floating point literal.
@@ -469,7 +500,11 @@ impl Literal {
         if !n.is_finite() {
             panic!("Invalid float literal {}", n);
         }
-        Literal(token::Literal(token::Lit::Float(Symbol::intern(&n.to_string())), None))
+        Literal {
+            kind: LiteralKind::Float,
+            contents: Term::intern(&n.to_string()),
+            suffix: None,
+        }
     }
 
     /// Floating point literal.
@@ -478,8 +513,11 @@ impl Literal {
         if !n.is_finite() {
             panic!("Invalid f32 literal {}", n);
         }
-        Literal(token::Literal(token::Lit::Float(Symbol::intern(&n.to_string())),
-                               Some(Symbol::intern("f32"))))
+        Literal {
+            kind: LiteralKind::Float,
+            contents: Term::intern(&n.to_string()),
+            suffix: Some(Term::intern("f32")),
+        }
     }
 
     /// Floating point literal.
@@ -488,8 +526,11 @@ impl Literal {
         if !n.is_finite() {
             panic!("Invalid f64 literal {}", n);
         }
-        Literal(token::Literal(token::Lit::Float(Symbol::intern(&n.to_string())),
-                               Some(Symbol::intern("f64"))))
+        Literal {
+            kind: LiteralKind::Float,
+            contents: Term::intern(&n.to_string()),
+            suffix: Some(Term::intern("f64")),
+        }
     }
 
     /// String literal.
@@ -499,7 +540,11 @@ impl Literal {
         for ch in string.chars() {
             escaped.extend(ch.escape_debug());
         }
-        Literal(token::Literal(token::Lit::Str_(Symbol::intern(&escaped)), None))
+        Literal {
+            kind: LiteralKind::Str_,
+            contents: Term::intern(&escaped),
+            suffix: None,
+        }
     }
 
     /// Character literal.
@@ -507,7 +552,11 @@ impl Literal {
     pub fn character(ch: char) -> Literal {
         let mut escaped = String::new();
         escaped.extend(ch.escape_unicode());
-        Literal(token::Literal(token::Lit::Char(Symbol::intern(&escaped)), None))
+        Literal {
+            kind: LiteralKind::Char,
+            contents: Term::intern(&escaped),
+            suffix: None,
+        }
     }
 
     /// Byte string literal.
@@ -515,73 +564,30 @@ impl Literal {
     pub fn byte_string(bytes: &[u8]) -> Literal {
         let string = bytes.iter().cloned().flat_map(ascii::escape_default)
             .map(Into::<char>::into).collect::<String>();
-        Literal(token::Literal(token::Lit::ByteStr(Symbol::intern(&string)), None))
-    }
-}
-
-macro_rules! literals {
-    ($($i:ident),*; $($raw:ident),*) => {
-        #[unstable(feature = "proc_macro_internals", issue = "27812")]
-        #[doc(hidden)]
-        pub enum LiteralKind {
-            $($i,)*
-            $($raw(usize),)*
-        }
-
-        impl LiteralKind {
-            #[unstable(feature = "proc_macro_internals", issue = "27812")]
-            #[doc(hidden)]
-            pub fn with_contents_and_suffix(self, contents: Term, suffix: Option<Term>)
-                                            -> Literal {
-                let contents = contents.0;
-                let suffix = suffix.map(|t| t.0);
-                match self {
-                    $(LiteralKind::$i => {
-                        Literal(token::Literal(token::Lit::$i(contents), suffix))
-                    })*
-                    $(LiteralKind::$raw(n) => {
-                        Literal(token::Literal(token::Lit::$raw(contents, n), suffix))
-                    })*
-                }
-            }
-        }
-
-        impl Literal {
-            fn kind(&self) -> LiteralKind {
-                let lit = match self.0 {
-                    token::Literal(lit, _) => lit,
-                    _ => panic!("unsupported literal {:?}", self.0),
-                };
-
-                match lit {
-                    $(token::Lit::$i(_) => LiteralKind::$i,)*
-                    $(token::Lit::$raw(_, n) => LiteralKind::$raw(n),)*
-                }
-            }
-
-            fn contents(&self) -> Term {
-                let lit = match self.0 {
-                    token::Literal(lit, _) => lit,
-                    _ => panic!("unsupported literal {:?}", self.0),
-                };
-
-                match lit {
-                    $(token::Lit::$i(contents))|* |
-                    $(token::Lit::$raw(contents, _))|* => Term(contents)
-                }
-            }
-
-            fn suffix(&self) -> Option<Term> {
-                match self.0 {
-                    token::Literal(_, suffix) => suffix.map(Term),
-                    _ => panic!("unsupported literal {:?}", self.0),
-                }
-            }
+        Literal {
+            kind: LiteralKind::ByteStr,
+            contents: Term::intern(&string),
+            suffix: None,
         }
     }
 }
 
-literals!(Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw);
+#[derive(Copy, Clone)]
+#[unstable(feature = "proc_macro_internals", issue = "27812")]
+#[doc(hidden)]
+pub enum LiteralKind {
+    DocComment,
+
+    Byte,
+    Char,
+    Float,
+    Str_,
+    Integer,
+    ByteStr,
+
+    StrRaw(usize),
+    ByteStrRaw(usize),
+}
 
 /// An iterator over `TokenTree`s.
 #[derive(Clone)]

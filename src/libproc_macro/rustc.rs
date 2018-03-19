@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use {Delimiter, Spacing, Term, TokenNode};
+use {Delimiter, Literal, LiteralKind, Spacing, Term, TokenNode};
 
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{Diagnostic, DiagnosticBuilder, Level};
@@ -68,6 +68,56 @@ impl Delimiter {
         }
     }
 }
+
+macro_rules! literals {
+    ($($i:ident),*; $($raw:ident),*) => {
+        impl Literal {
+            fn from_internal(token: token::Token) -> Self {
+                let (lit, suffix) = match token {
+                    token::Literal(lit, suffix) => (lit, suffix),
+                    token::DocComment(contents) => {
+                        return Literal {
+                            kind: LiteralKind::DocComment,
+                            contents: Term(contents),
+                            suffix: None
+                        };
+                    }
+                    _ => panic!("unsupported literal {:?}", token),
+                };
+
+                let (kind, contents) = match lit {
+                    $(token::Lit::$i(contents) => (LiteralKind::$i, contents),)*
+                    $(token::Lit::$raw(contents, n) => (LiteralKind::$raw(n), contents),)*
+                };
+
+                Literal {
+                    kind,
+                    contents: Term(contents),
+                    suffix: suffix.map(Term)
+                }
+            }
+
+            fn to_internal(self) -> token::Token {
+                let contents = self.contents.0;
+                let suffix = self.suffix.map(|t| t.0);
+                match self.kind {
+                    LiteralKind::DocComment => {
+                        assert_eq!(suffix, None);
+                        token::DocComment(contents)
+                    }
+                    $(LiteralKind::$i => {
+                        token::Literal(token::Lit::$i(contents), suffix)
+                    })*
+                    $(LiteralKind::$raw(n) => {
+                        token::Literal(token::Lit::$raw(contents, n), suffix)
+                    })*
+                }
+            }
+        }
+    }
+}
+
+literals!(Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw);
 
 pub struct Rustc<'a> {
     sess: &'a ParseSess,
@@ -134,7 +184,9 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
                 };
                 return TokenTree::Token(span, token).into();
             }
-            TokenNode::Literal(token) => return TokenTree::Token(span, token.0).into(),
+            TokenNode::Literal(literal) => {
+                return TokenTree::Token(span, literal.to_internal()).into()
+            }
         };
 
         let token = match op {
@@ -255,7 +307,9 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
             Question => op!('?'),
 
             Ident(ident) | Lifetime(ident) => TokenNode::Term(Term(ident.name)),
-            Literal(..) | DocComment(..) => TokenNode::Literal(::Literal(token)),
+            Literal(..) | DocComment(..) => {
+                TokenNode::Literal(::Literal::from_internal(token))
+            }
 
             Interpolated(_) => {
                 let tts = token.interpolated_to_tokenstream(self.sess, span);
