@@ -31,14 +31,14 @@ mod generation {
 
     #[repr(C)]
     #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub(super) struct Generation(usize);
+    pub(super) struct Generation(u32);
 
     impl !Send for Generation {}
     impl !Sync for Generation {}
 
     impl Generation {
         pub(super) extern "C" fn next() -> Self {
-            thread_local!(static NEXT: Cell<usize> = Cell::new(0));
+            thread_local!(static NEXT: Cell<u32> = Cell::new(0));
             NEXT.with(|next| {
                 let gen = next.get();
                 next.set(gen.checked_add(1).expect("Generation::next overflowed counter"));
@@ -96,6 +96,12 @@ mod storage {
     impl<S: FromConcrete<T, U>, T, U> FromConcrete<Option<T>, Option<U>> for S {
         fn from_concrete(&self, x: Option<T>) -> Option<U> {
             x.map(|x| self.from_concrete(x))
+        }
+    }
+
+    impl<S: ToConcrete<T, U>, T, U> ToConcrete<Option<T>, Option<U>> for S {
+        fn to_concrete(&self, x: Option<T>) -> Option<U> {
+            x.map(|x| self.to_concrete(x))
         }
     }
 
@@ -184,6 +190,47 @@ mod storage {
             }
         }
     }
+
+    pub(super) trait Pod: Copy {}
+    impl Pod for u32 {}
+
+    #[repr(C)]
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    pub(super) struct Inline<T, R: Pod = u32> {
+        repr: R,
+        gen: Generation,
+        _marker: PhantomData<T>,
+    }
+
+    impl<T, R: Pod> !Send for Inline<T, R> {}
+    impl<T, R: Pod> !Sync for Inline<T, R> {}
+
+    impl<S, T: Concrete<S>, R: Pod> FromConcrete<T::Concrete, Inline<T, R>> for Storage<S>
+        where T::Concrete: Copy
+    {
+        fn from_concrete(&self, x: T::Concrete) -> Inline<T, R> {
+            assert_eq!(mem::size_of::<T::Concrete>(), mem::size_of::<R>());
+            Inline {
+                repr: unsafe {
+                    mem::transmute_copy(&x)
+                },
+                gen: self.gen,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    impl<S, T: Concrete<S>, R: Pod> ToConcrete<Inline<T, R>, T::Concrete> for Storage<S>
+        where T::Concrete: Copy
+    {
+        fn to_concrete(&self, x: Inline<T, R>) -> T::Concrete {
+            assert_eq!(mem::size_of::<T::Concrete>(), mem::size_of::<R>());
+            assert_eq!(x.gen, self.gen);
+            unsafe {
+                mem::transmute_copy(&x.repr)
+            }
+        }
+    }
 }
 
 storage_concrete_passthrough! {
@@ -192,10 +239,11 @@ storage_concrete_passthrough! {
     ['a] &'a str,
 
     // FIXME(eddyb) achieve ABI compatibility for these types.
-    [] ::TokenTree,
-    [] ::Span,
+    [] ::TokenNode,
     [] ::Delimiter,
     [] ::LexError,
+    [] ::LineColumn,
+    [] ::Level,
 
     [] PathBuf,
     // NOTE(eddyb) this will need some `extern "C" fn write`.
@@ -221,16 +269,16 @@ macro_rules! each_frontend_method {
         $meth!(fn token_stream_is_empty(&self, stream: &Self::TokenStream) -> bool;);
         $meth!(fn token_stream_from_str(&self, src: &str)
                                         -> Result<Self::TokenStream, ::LexError>;);
-        $meth!(fn token_stream_delimited(&self, span: ::Span,
+        $meth!(fn token_stream_delimited(&self, span: Self::Span,
                                          delimiter: ::Delimiter,
                                          delimed: Self::TokenStream)
                                          -> Self::TokenStream;);
-        $meth!(fn token_stream_from_token_tree(&self, tree: ::TokenTree)
+        $meth!(fn token_stream_from_token_tree(&self, node: ::TokenNode, span: Self::Span)
                                                -> Self::TokenStream;);
         $meth!(fn token_stream_to_token_tree(&self, stream: Self::TokenStream)
-                                             -> Result<(::TokenTree, Option<Self::TokenStream>),
-                                                       (::Span, (::Delimiter,
-                                                                 Self::TokenStream))>;);
+                                             -> (Self::Span,
+                                                 Result<(::TokenNode, Option<Self::TokenStream>),
+                                                        (::Delimiter, Self::TokenStream)>););
         $meth!(fn token_stream_trees(&self, stream: Self::TokenStream) -> Self::TokenCursor;);
 
         $meth!(fn token_stream_builder_cleanup(&self, _builder: Self::TokenStreamBuilder) -> () {});
@@ -256,7 +304,25 @@ macro_rules! each_frontend_method {
         $meth!(fn source_file_path(&self, file: &Self::SourceFile) -> PathBuf;);
         $meth!(fn source_file_is_real(&self, file: &Self::SourceFile) -> bool;);
 
-        $meth!(fn span_source_file(&self, span: ::Span) -> Self::SourceFile;);
+        $meth!(fn diagnostic_cleanup(&self, _diagnostic: Self::Diagnostic) -> () {});
+        $meth!(fn diagnostic_new(&self, level: ::Level, msg: &str, span: Option<Self::Span>)
+                                 -> Self::Diagnostic;);
+        $meth!(fn diagnostic_sub(&self, diagnostic: &mut Self::Diagnostic,
+                                 level: ::Level, msg: &str, span: Option<Self::Span>) -> (););
+        $meth!(fn diagnostic_emit(&self, diagnostic: Self::Diagnostic) -> (););
+
+        $meth!(fn span_debug(&self, span: Self::Span, f: &mut fmt::Formatter) -> fmt::Result {
+            fmt::Debug::fmt(&span, f)
+        });
+        $meth!(fn span_def_site(&self) -> Self::Span;);
+        $meth!(fn span_call_site(&self) -> Self::Span;);
+        $meth!(fn span_source_file(&self, span: Self::Span) -> Self::SourceFile;);
+        $meth!(fn span_parent(&self, span: Self::Span) -> Option<Self::Span>;);
+        $meth!(fn span_source(&self, span: Self::Span) -> Self::Span;);
+        $meth!(fn span_start(&self, span: Self::Span) -> ::LineColumn;);
+        $meth!(fn span_end(&self, span: Self::Span) -> ::LineColumn;);
+        $meth!(fn span_join(&self, first: Self::Span, second: Self::Span) -> Option<Self::Span>;);
+        $meth!(fn span_resolved_at(&self, span: Self::Span, at: Self::Span) -> Self::Span;);
     }
 }
 
@@ -268,6 +334,9 @@ pub trait FrontendInterface {
     type TokenStreamBuilder: 'static;
     type TokenCursor: 'static + Clone;
     type SourceFile: 'static + Clone;
+    type Diagnostic: 'static;
+    /// NB. has to be the same size as u32.
+    type Span: 'static + Copy + Eq + fmt::Debug;
     each_frontend_method!(define_frontend_trait_method);
 }
 
@@ -328,6 +397,9 @@ define_boxed! {
     },
     SourceFile {
         cleanup: source_file_cleanup
+    },
+    Diagnostic {
+        cleanup: diagnostic_cleanup
     }
 }
 
@@ -361,6 +433,41 @@ impl Clone for SourceFile {
     }
 }
 
+macro_rules! define_inline {
+    ($($name:ident),*) => {
+        $(
+            #[repr(C)]
+            #[derive(Copy, Clone, PartialEq, Eq)]
+            pub(crate) struct $name(storage::Inline<$name>);
+            impl<F: FrontendInterface> storage::Concrete<F> for $name {
+                type Concrete = F::$name;
+            }
+            impl<S, T: Copy + 'static> FromConcrete<T, $name> for storage::Storage<S>
+                where $name: storage::Concrete<S, Concrete = T>
+            {
+                fn from_concrete(&self, x: T) -> $name {
+                    $name(self.from_concrete(x))
+                }
+            }
+            impl<S, T: Copy + 'static> ToConcrete<$name, T> for storage::Storage<S>
+                where $name: storage::Concrete<S, Concrete = T>
+            {
+                fn to_concrete(&self, x: $name) -> T {
+                    self.to_concrete(x.0)
+                }
+            }
+        )*
+    }
+}
+
+define_inline!(Span);
+
+impl fmt::Debug for Span {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        Frontend.span_debug(*self, f)
+    }
+}
+
 pub(crate) struct Frontend;
 
 macro_rules! define_frontend_current_method {
@@ -376,6 +483,8 @@ impl FrontendInterface for Frontend {
     type TokenStreamBuilder = TokenStreamBuilder;
     type TokenCursor = TokenCursor;
     type SourceFile = SourceFile;
+    type Diagnostic = Diagnostic;
+    type Span = Span;
     each_frontend_method!(define_frontend_current_method);
 }
 
@@ -385,6 +494,8 @@ type CurrentFrontend<'a> = FrontendInterface<
     TokenStreamBuilder = TokenStreamBuilder,
     TokenCursor = TokenCursor,
     SourceFile = SourceFile,
+    Diagnostic = Diagnostic,
+    Span = Span,
 > + 'a;
 
 // Emulate scoped_thread_local!() here essentially
@@ -448,6 +559,8 @@ fn erase_concrete_frontend<F, G, R>(ng: extern "C" fn() -> generation::Generatio
         type TokenStreamBuilder = TokenStreamBuilder;
         type TokenCursor = TokenCursor;
         type SourceFile = SourceFile;
+        type Diagnostic = Diagnostic;
+        type Span = Span;
         each_frontend_method!(define_frontend_erase_concrete_method);
     }
 

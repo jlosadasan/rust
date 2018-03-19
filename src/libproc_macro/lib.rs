@@ -69,8 +69,6 @@ use std::str::FromStr;
 
 use syntax::parse::token;
 use syntax::symbol::Symbol;
-use syntax_pos::DUMMY_SP;
-use syntax_pos::{Pos, SyntaxContext};
 
 /// The main type provided by this crate, representing an abstract stream of
 /// tokens.
@@ -127,9 +125,9 @@ impl From<TokenTree> for TokenStream {
     fn from(tree: TokenTree) -> TokenStream {
         TokenStream(match tree.kind {
             TokenNode::Group(delimiter, tokens) => {
-                Frontend.token_stream_delimited(tree.span, delimiter, tokens.0)
+                Frontend.token_stream_delimited(tree.span.0, delimiter, tokens.0)
             }
-            _ => Frontend.token_stream_from_token_tree(tree)
+            _ => Frontend.token_stream_from_token_tree(tree.kind, tree.span.0)
         })
     }
 }
@@ -182,18 +180,7 @@ impl TokenStream {
 /// A region of source code, along with macro expansion information.
 #[unstable(feature = "proc_macro", issue = "38356")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Span(syntax_pos::Span);
-
-impl Span {
-    /// A span that resolves at the macro definition site.
-    #[unstable(feature = "proc_macro", issue = "38356")]
-    pub fn def_site() -> Span {
-        ::__internal::with_sess(|(_, mark)| {
-            let call_site = mark.expn_info().unwrap().call_site;
-            Span(call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark)))
-        })
-    }
-}
+pub struct Span(bridge::Span);
 
 /// Quote a `Span` into a `TokenStream`.
 /// This is needed to implement a custom quoter.
@@ -214,23 +201,29 @@ macro_rules! diagnostic_method {
 }
 
 impl Span {
+    /// A span that resolves at the macro definition site.
+    #[unstable(feature = "proc_macro", issue = "38356")]
+    pub fn def_site() -> Span {
+        Span(Frontend.span_def_site())
+    }
+
     /// The span of the invocation of the current procedural macro.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn call_site() -> Span {
-        ::__internal::with_sess(|(_, mark)| Span(mark.expn_info().unwrap().call_site))
+        Span(Frontend.span_call_site())
     }
 
     /// The original source file into which this span points.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn source_file(&self) -> SourceFile {
-        SourceFile(Frontend.span_source_file(*self))
+        SourceFile(Frontend.span_source_file(self.0))
     }
 
     /// The `Span` for the tokens in the previous macro expansion from which
     /// `self` was generated from, if any.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn parent(&self) -> Option<Span> {
-        self.0.ctxt().outer().expn_info().map(|i| Span(i.call_site))
+        Frontend.span_parent(self.0).map(Span)
     }
 
     /// The span for the origin source code that `self` was generated from. If
@@ -238,27 +231,19 @@ impl Span {
     /// value is the same as `*self`.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn source(&self) -> Span {
-        Span(self.0.source_callsite())
+        Span(Frontend.span_source(self.0))
     }
 
     /// Get the starting line/column in the source file for this span.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn start(&self) -> LineColumn {
-        let loc = __internal::lookup_char_pos(self.0.lo());
-        LineColumn {
-            line: loc.line,
-            column: loc.col.to_usize()
-        }
+        Frontend.span_start(self.0)
     }
 
     /// Get the ending line/column in the source file for this span.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn end(&self) -> LineColumn {
-        let loc = __internal::lookup_char_pos(self.0.hi());
-        LineColumn {
-            line: loc.line,
-            column: loc.col.to_usize()
-        }
+        Frontend.span_end(self.0)
     }
 
     /// Create a new span encompassing `self` and `other`.
@@ -266,19 +251,14 @@ impl Span {
     /// Returns `None` if `self` and `other` are from different files.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn join(&self, other: Span) -> Option<Span> {
-        let self_loc = __internal::lookup_char_pos(self.0.lo());
-        let other_loc = __internal::lookup_char_pos(other.0.lo());
-
-        if self_loc.file.name != other_loc.file.name { return None }
-
-        Some(Span(self.0.to(other.0)))
+        Frontend.span_join(self.0, other.0).map(Span)
     }
 
     /// Creates a new span with the same line/column information as `self` but
     /// that resolves symbols as though it were at `other`.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn resolved_at(&self, other: Span) -> Span {
-        Span(self.0.with_ctxt(other.0.ctxt()))
+        Span(Frontend.span_resolved_at(self.0, other.0))
     }
 
     /// Creates a new span with the same name resolution behavior as `self` but
@@ -449,7 +429,7 @@ pub struct Literal(token::Token);
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        TokenTree { kind: TokenNode::Literal(self.clone()), span: Span(DUMMY_SP) }.fmt(f)
+        TokenTree { kind: TokenNode::Literal(self.clone()), span: Span::def_site() }.fmt(f)
     }
 }
 
@@ -548,17 +528,19 @@ impl Iterator for TokenTreeIter {
         let next = unwrap_or!(self.next.take().or_else(|| {
             Frontend.token_cursor_next(&mut self.cursor)
         }), return None);
-        let (tree, next) = match Frontend.token_stream_to_token_tree(next) {
-            Ok((tree, next)) => (tree, next),
-            Err((span, (delimiter, delimed))) => {
-                (TokenTree {
-                    span,
-                    kind: TokenNode::Group(delimiter, TokenStream(delimed)),
-                }, None)
+        let (span, kind) = match Frontend.token_stream_to_token_tree(next) {
+            (span, Ok((kind, next))) => {
+                self.next = next;
+                (span, kind)
+            }
+            (span, Err((delimiter, delimed))) => {
+                (span, TokenNode::Group(delimiter, TokenStream(delimed)))
             }
         };
-        self.next = next;
-        Some(tree)
+        Some(TokenTree {
+            span: Span(span),
+            kind
+        })
     }
 }
 

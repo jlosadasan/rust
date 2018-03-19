@@ -8,11 +8,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use {__internal, Delimiter, Spacing, Span, Term, TokenNode, TokenTree};
+use {__internal, Delimiter, Spacing, Term, TokenNode};
 
 use rustc_data_structures::sync::Lrc;
+use rustc_errors::{Diagnostic, DiagnosticBuilder, Level};
 use std::path::PathBuf;
-use syntax_pos::{self, SyntaxContext, FileMap, FileName};
+use syntax_pos::{self, SyntaxContext, FileMap, FileName, MultiSpan, Pos, DUMMY_SP};
 use syntax_pos::hygiene::Mark;
 use syntax::ast;
 use syntax::ext::base::{ExtCtxt, ProcMacro};
@@ -32,6 +33,18 @@ impl ProcMacro for Quoter {
         info.callee.allow_internal_unstable = true;
         cx.current_expansion.mark.set_expn_info(info);
         __internal::set_sess(cx, || expand_quoter.run(Rustc, stream))
+    }
+}
+
+impl ::Level {
+    fn to_internal(self) -> Level {
+        match self {
+            ::Level::Error => Level::Error,
+            ::Level::Warning => Level::Warning,
+            ::Level::Note => Level::Note,
+            ::Level::Help => Level::Help,
+            ::Level::__Nonexhaustive => unreachable!("Level::__Nonexhaustive")
+        }
     }
 }
 
@@ -61,6 +74,8 @@ impl ::bridge::FrontendInterface for Rustc {
     type TokenStreamBuilder = tokenstream::TokenStreamBuilder;
     type TokenCursor = tokenstream::Cursor;
     type SourceFile = Lrc<FileMap>;
+    type Diagnostic = Diagnostic;
+    type Span = syntax_pos::Span;
 
     fn token_stream_empty(&self) -> Self::TokenStream {
         tokenstream::TokenStream::empty()
@@ -81,32 +96,33 @@ impl ::bridge::FrontendInterface for Rustc {
             Ok(parse::parse_stream_from_source_str(name, src, sess, Some(span)))
         })
     }
-    fn token_stream_delimited(&self, span: ::Span,
+    fn token_stream_delimited(&self, span: Self::Span,
                               delimiter: ::Delimiter,
                               delimed: Self::TokenStream)
                               -> Self::TokenStream {
-        tokenstream::TokenTree::Delimited(span.0, tokenstream::Delimited {
+        tokenstream::TokenTree::Delimited(span, tokenstream::Delimited {
             delim: delimiter.to_internal(),
             tts: delimed.into(),
         }).into()
     }
-    fn token_stream_from_token_tree(&self, tree: TokenTree) -> Self::TokenStream {
+    fn token_stream_from_token_tree(&self, node: ::TokenNode, span: Self::Span)
+                                    -> Self::TokenStream {
         use syntax::parse::token::*;
         use syntax::tokenstream::TokenTree;
 
-        let (op, kind) = match tree.kind {
+        let (op, kind) = match node {
             TokenNode::Op(op, kind) => (op, kind),
             TokenNode::Group(..) => unreachable!(),
             TokenNode::Term(symbol) => {
-                let ident = ast::Ident { name: symbol.0, ctxt: tree.span.0.ctxt() };
+                let ident = ast::Ident { name: symbol.0, ctxt: span.ctxt() };
                 let token = if symbol.0.as_str().starts_with("'") {
                     Lifetime(ident)
                 } else {
                     Ident(ident)
                 };
-                return TokenTree::Token(tree.span.0, token).into();
+                return TokenTree::Token(span, token).into();
             }
-            TokenNode::Literal(token) => return TokenTree::Token(tree.span.0, token.0).into(),
+            TokenNode::Literal(token) => return TokenTree::Token(span, token.0).into(),
         };
 
         let token = match op {
@@ -134,15 +150,16 @@ impl ::bridge::FrontendInterface for Rustc {
             _ => panic!("unsupported character {}", op),
         };
 
-        let tree = TokenTree::Token(tree.span.0, token);
+        let tree = TokenTree::Token(span, token);
         match kind {
             Spacing::Alone => tree.into(),
             Spacing::Joint => tree.joint(),
         }
     }
     fn token_stream_to_token_tree(&self, stream: Self::TokenStream)
-                                  -> Result<(::TokenTree, Option<Self::TokenStream>),
-                                            (::Span, (::Delimiter, Self::TokenStream))> {
+                                  -> (Self::Span,
+                                      Result<(::TokenNode, Option<Self::TokenStream>),
+                                             (::Delimiter, Self::TokenStream)>) {
         use syntax::parse::token::*;
 
         let mut next = None;
@@ -151,7 +168,7 @@ impl ::bridge::FrontendInterface for Rustc {
         let (mut span, token) = match tree {
             tokenstream::TokenTree::Delimited(span, delimed) => {
                 let delimiter = Delimiter::from_internal(delimed.delim);
-                return Err((Span(span), (delimiter, delimed.tts.into())));
+                return (span, Err((delimiter, delimed.tts.into())));
             }
             tokenstream::TokenTree::Token(span, token) => (span, token),
         };
@@ -229,7 +246,7 @@ impl ::bridge::FrontendInterface for Rustc {
             Literal(..) | DocComment(..) => TokenNode::Literal(::Literal(token)),
 
             Interpolated(_) => {
-                return Err((Span(span), __internal::with_sess(|(sess, _)| {
+                return (span, Err(__internal::with_sess(|(sess, _)| {
                     let tts = token.interpolated_to_tokenstream(sess, span);
                     (Delimiter::None, tts)
                 })));
@@ -240,7 +257,7 @@ impl ::bridge::FrontendInterface for Rustc {
             Whitespace | Comment | Shebang(..) | Eof => unreachable!(),
         };
 
-        Ok((TokenTree { span: Span(span), kind: kind }, next))
+        (span, Ok((kind, next)))
     }
     fn token_stream_trees(&self, stream: Self::TokenStream) -> Self::TokenCursor {
         stream.trees()
@@ -295,7 +312,69 @@ impl ::bridge::FrontendInterface for Rustc {
         file.is_real_file()
     }
 
-    fn span_source_file(&self, span: ::Span) -> Self::SourceFile {
-        ::__internal::lookup_char_pos(span.0.lo()).file
+    fn diagnostic_new(&self, level: ::Level, msg: &str, span: Option<Self::Span>)
+                      -> Self::Diagnostic {
+        let mut diagnostic = Diagnostic::new(level.to_internal(), msg);
+
+        if let Some(span) = span {
+            diagnostic.set_span(span);
+        }
+
+        diagnostic
+
+    }
+    fn diagnostic_sub(&self, diagnostic: &mut Self::Diagnostic,
+                      level: ::Level, msg: &str, span: Option<Self::Span>) {
+        let span = span.map(|s| s.into()).unwrap_or(MultiSpan::new());
+        diagnostic.sub(level.to_internal(), msg, span, None);
+    }
+    fn diagnostic_emit(&self, diagnostic: Self::Diagnostic) {
+        ::__internal::with_sess(move |(sess, _)| {
+            DiagnosticBuilder::new_diagnostic(&sess.span_diagnostic, diagnostic).emit()
+        });
+    }
+
+    fn span_def_site(&self) -> Self::Span {
+        ::__internal::with_sess(|(_, mark)| {
+            let call_site = mark.expn_info().unwrap().call_site;
+            call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark))
+        })
+    }
+    fn span_call_site(&self) -> Self::Span {
+        ::__internal::with_sess(|(_, mark)| mark.expn_info().unwrap().call_site)
+    }
+    fn span_source_file(&self, span: Self::Span) -> Self::SourceFile {
+        ::__internal::lookup_char_pos(span.lo()).file
+    }
+    fn span_parent(&self, span: Self::Span) -> Option<Self::Span> {
+        span.ctxt().outer().expn_info().map(|i| i.call_site)
+    }
+    fn span_source(&self, span: Self::Span) -> Self::Span {
+        span.source_callsite()
+    }
+    fn span_start(&self, span: Self::Span) -> ::LineColumn {
+        let loc = ::__internal::lookup_char_pos(span.lo());
+        ::LineColumn {
+            line: loc.line,
+            column: loc.col.to_usize()
+        }
+    }
+    fn span_end(&self, span: Self::Span) -> ::LineColumn {
+        let loc = ::__internal::lookup_char_pos(span.hi());
+        ::LineColumn {
+            line: loc.line,
+            column: loc.col.to_usize()
+        }
+    }
+    fn span_join(&self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
+        let self_loc = ::__internal::lookup_char_pos(first.lo());
+        let other_loc = ::__internal::lookup_char_pos(second.lo());
+
+        if self_loc.file.name != other_loc.file.name { return None }
+
+        Some(first.to(second))
+    }
+    fn span_resolved_at(&self, span: Self::Span, at: Self::Span) -> Self::Span {
+        span.with_ctxt(at.ctxt())
     }
 }
