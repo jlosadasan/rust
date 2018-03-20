@@ -24,7 +24,6 @@ use std::sync::mpsc::{Sender};
 use syntax_pos::{SpanData};
 use ty::maps::{QueryMsg};
 use dep_graph::{DepNode};
-use proc_macro;
 use lazy_static;
 use session::Session;
 
@@ -47,9 +46,7 @@ lazy_static! {
 }
 
 fn panic_hook(info: &panic::PanicInfo) {
-    if !proc_macro::bridge::has_current_frontend() {
-        (*DEFAULT_HOOK)(info)
-    }
+    (*DEFAULT_HOOK)(info)
 }
 
 pub fn install_panic_hook() {

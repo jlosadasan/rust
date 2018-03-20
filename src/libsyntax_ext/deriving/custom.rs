@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::panic;
-
 use errors::FatalError;
 use syntax::ast::{self, ItemKind, Attribute, Mac};
 use syntax::attr::{mark_used, mark_known};
@@ -79,11 +77,8 @@ impl MultiItemModifier for ProcMacroDerive {
         let item = ecx.resolver.eliminate_crate_var(item.clone());
         let token = Token::interpolated(token::NtItem(item));
         let input = tokenstream::TokenTree::Token(DUMMY_SP, token).into();
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            self.inner.run(::proc_macro_impl::Frontend::new(ecx), input)
-        }));
 
-        let stream = match res {
+        let stream = match self.inner.run(::proc_macro_impl::Frontend::new(ecx), input) {
             Ok(stream) => stream,
             Err(e) => {
                 let msg = "proc-macro derive panicked";

@@ -1270,6 +1270,9 @@ dependencies = [
 [[package]]
 name = "proc_macro"
 version = "0.0.0"
+dependencies = [
+ "lazy_static 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 
 [[package]]
 name = "profiler_builtins"

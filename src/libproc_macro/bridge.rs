@@ -22,8 +22,10 @@
 use std::cell::Cell;
 use std::fmt;
 use std::ops::Deref;
+use std::panic;
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::thread;
 
 use self::storage::{FromConcrete, ToConcrete, Storage};
 
@@ -580,8 +582,20 @@ thread_local! {
     static CURRENT_FRONTEND: Cell<Option<NonNull<CurrentFrontend<'static>>>> = Cell::new(None);
 }
 
-pub fn has_current_frontend() -> bool {
-    CURRENT_FRONTEND.with(|p| p.get().is_some())
+// Hide the default panic output within `proc_macro` expansions.
+// NB. frontends can't do this because they may use a different libstd.
+lazy_static! {
+    static ref DEFAULT_HOOK: Box<Fn(&panic::PanicInfo) + Sync + Send + 'static> = {
+        let hook = panic::take_hook();
+        panic::set_hook(Box::new(panic_hook));
+        hook
+    };
+}
+
+fn panic_hook(info: &panic::PanicInfo) {
+    if CURRENT_FRONTEND.with(|p| p.get().is_none()) {
+        (*DEFAULT_HOOK)(info)
+    }
 }
 
 fn with_current_frontend<F, R>(f: F) -> R
@@ -603,6 +617,9 @@ fn set_current_frontend<F, R>(frontend: &CurrentFrontend, f: F) -> R
             CURRENT_FRONTEND.with(|p| p.set(self.prev));
         }
     }
+
+    // Ensure panic output hiding is set up.
+    ::lazy_static::initialize(&DEFAULT_HOOK);
 
     CURRENT_FRONTEND.with(|p| {
         let _reset = Reset { prev: p.get() };
@@ -657,8 +674,9 @@ fn erase_concrete_frontend<F, G, R>(ng: extern "C" fn() -> generation::Generatio
 pub struct Expand1 {
     next_generation: extern "C" fn() -> generation::Generation,
     data: *const (),
+    // FIXME(eddyb) achieve ABI compatibility for the `thread::Result` type.
     run: unsafe extern "C" fn(*const (), &&CurrentFrontend, TokenStream)
-                              -> TokenStream,
+                              -> thread::Result<TokenStream>,
 }
 
 impl !Send for Expand1 {}
@@ -670,12 +688,15 @@ impl Expand1 {
     {
         unsafe extern "C" fn run<F>(f: *const (),
                                     frontend: &&CurrentFrontend,
-                                    input: TokenStream) -> TokenStream
+                                    input: TokenStream)
+                                    -> thread::Result<TokenStream>
             where F: Fn(::TokenStream) -> ::TokenStream
         {
             let f = &*(f as *const F);
             set_current_frontend(*frontend, || {
-                f(::TokenStream(input)).0
+                panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    f(::TokenStream(input)).0
+                }))
             })
         }
         Expand1 {
@@ -685,7 +706,8 @@ impl Expand1 {
         }
     }
 
-    pub fn run<F>(&self, frontend: F, input: F::TokenStream) -> F::TokenStream
+    pub fn run<F>(&self, frontend: F, input: F::TokenStream)
+                  -> thread::Result<F::TokenStream>
         where F: FrontendInterface<TokenNode = TokenNode<F>>
     {
         erase_concrete_frontend(self.next_generation, frontend, |frontend, storage| {
@@ -693,7 +715,7 @@ impl Expand1 {
             let output = unsafe {
                 (self.run)(self.data, &frontend, input)
             };
-            storage.to_concrete(output)
+            output.map(|output| storage.to_concrete(output))
         })
     }
 }
@@ -705,8 +727,9 @@ impl Expand1 {
 pub struct Expand2 {
     next_generation: extern "C" fn() -> generation::Generation,
     data: *const (),
+    // FIXME(eddyb) achieve ABI compatibility for the `thread::Result` type.
     run: unsafe extern "C" fn(*const (), &&CurrentFrontend, TokenStream, TokenStream)
-                              -> TokenStream,
+                              -> thread::Result<TokenStream>,
 }
 
 impl !Send for Expand2 {}
@@ -719,12 +742,15 @@ impl Expand2 {
         unsafe extern "C" fn run<F>(f: *const (),
                                     frontend: &&CurrentFrontend,
                                     input: TokenStream,
-                                    input2: TokenStream) -> TokenStream
+                                    input2: TokenStream)
+                                    -> thread::Result<TokenStream>
             where F: Fn(::TokenStream, ::TokenStream) -> ::TokenStream
         {
             let f = &*(f as *const F);
             set_current_frontend(*frontend, || {
-                f(::TokenStream(input), ::TokenStream(input2)).0
+                panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    f(::TokenStream(input), ::TokenStream(input2)).0
+                }))
             })
         }
         Expand2 {
@@ -735,7 +761,7 @@ impl Expand2 {
     }
 
     pub fn run<F>(&self, frontend: F, input: F::TokenStream, input2: F::TokenStream)
-                  -> F::TokenStream
+                  -> thread::Result<F::TokenStream>
         where F: FrontendInterface<TokenNode = TokenNode<F>>
     {
         erase_concrete_frontend(self.next_generation, frontend, |frontend, storage| {
@@ -744,7 +770,7 @@ impl Expand2 {
             let output = unsafe {
                 (self.run)(self.data, &frontend, input, input2)
             };
-            storage.to_concrete(output)
+            output.map(|output| storage.to_concrete(output))
         })
     }
 }

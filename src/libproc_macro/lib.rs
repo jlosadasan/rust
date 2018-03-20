@@ -42,6 +42,9 @@
 #![feature(box_into_raw_non_null)]
 #![feature(nonnull_cast)]
 
+#[macro_use]
+extern crate lazy_static;
+
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
 #[doc(hidden)]
 pub mod bridge;

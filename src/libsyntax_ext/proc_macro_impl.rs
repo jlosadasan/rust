@@ -8,7 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::panic;
 use std::path::PathBuf;
 
 use errors::{Diagnostic, DiagnosticBuilder, FatalError, Level};
@@ -36,11 +35,7 @@ impl base::AttrProcMacro for AttrProcMacro {
                    annotation: TokenStream,
                    annotated: TokenStream)
                    -> TokenStream {
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            self.inner.run(Frontend::new(ecx), annotation, annotated)
-        }));
-
-        match res {
+        match self.inner.run(Frontend::new(ecx), annotation, annotated) {
             Ok(stream) => stream,
             Err(e) => {
                 let msg = "custom attribute panicked";
@@ -69,11 +64,7 @@ impl ProcMacro for BangProcMacro {
                    span: Span,
                    input: TokenStream)
                    -> TokenStream {
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            self.inner.run(Frontend::new(ecx), input)
-        }));
-
-        match res {
+        match self.inner.run(Frontend::new(ecx), input) {
             Ok(stream) => stream,
             Err(e) => {
                 let msg = "proc macro panicked";
@@ -105,7 +96,7 @@ impl ProcMacro for Quoter {
         info.callee.allow_internal_unstable = true;
         cx.current_expansion.mark.set_expn_info(info);
 
-        expand_quoter.run(Frontend::new(cx), stream)
+        expand_quoter.run(Frontend::new(cx), stream).unwrap()
     }
 }
 
