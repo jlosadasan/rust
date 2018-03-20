@@ -13,25 +13,25 @@ extern crate syntax_pos;
 extern crate rustc_errors;
 extern crate rustc_data_structures;
 
-use {Delimiter, Literal, LiteralKind, Spacing, Term, TokenNode};
+use {Delimiter, LiteralKind, Spacing};
+use bridge::{FrontendInterface, ThreadRef, TokenNode};
 
 use std::path::PathBuf;
 use self::rustc_data_structures::sync::Lrc;
 use self::rustc_errors::{Diagnostic, DiagnosticBuilder, Level};
-use self::syntax_pos::{SyntaxContext, FileMap, FileName, MultiSpan, Pos, DUMMY_SP};
+use self::syntax_pos::{SyntaxContext, FileMap, FileName, MultiSpan, Pos, DUMMY_SP, Span};
 use self::syntax_pos::hygiene::Mark;
+use self::syntax_pos::symbol::Symbol;
 use self::syntax::ast;
 use self::syntax::ext::base::{ExtCtxt, ProcMacro};
 use self::syntax::parse::{self, token, ParseSess};
 use self::syntax::tokenstream;
 
-pub use self::syntax_pos::symbol::Symbol;
-
 pub struct Quoter;
 
 impl ProcMacro for Quoter {
     fn expand<'cx>(&self, cx: &'cx mut ExtCtxt,
-                _: syntax_pos::Span,
+                _: Span,
                 stream: tokenstream::TokenStream)
                 -> tokenstream::TokenStream {
         let expand_quoter = ::bridge::Expand1::new(&::quote_token_stream);
@@ -78,16 +78,12 @@ impl Delimiter {
 
 macro_rules! literals {
     ($($i:ident),*; $($raw:ident),*) => {
-        impl Literal {
-            fn from_internal(token: token::Token) -> Self {
+        impl LiteralKind {
+            fn from_internal(token: token::Token) -> (Self, Symbol, Option<Symbol>) {
                 let (lit, suffix) = match token {
                     token::Literal(lit, suffix) => (lit, suffix),
                     token::DocComment(contents) => {
-                        return Literal {
-                            kind: LiteralKind::DocComment,
-                            contents: Term(contents),
-                            suffix: None
-                        };
+                        return (LiteralKind::DocComment, contents, None);
                     }
                     _ => panic!("unsupported literal {:?}", token),
                 };
@@ -97,17 +93,11 @@ macro_rules! literals {
                     $(token::Lit::$raw(contents, n) => (LiteralKind::$raw(n), contents),)*
                 };
 
-                Literal {
-                    kind,
-                    contents: Term(contents),
-                    suffix: suffix.map(Term)
-                }
+                (kind, contents, suffix)
             }
 
-            fn to_internal(self) -> token::Token {
-                let contents = self.contents.0;
-                let suffix = self.suffix.map(|t| t.0);
-                match self.kind {
+            fn to_internal(self, contents: Symbol, suffix: Option<Symbol>) -> token::Token {
+                match self {
                     LiteralKind::DocComment => {
                         assert_eq!(suffix, None);
                         token::DocComment(contents)
@@ -140,13 +130,16 @@ impl<'a> Rustc<'a> {
     }
 }
 
-impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
+impl<'a> FrontendInterface for Rustc<'a> {
     type TokenStream = tokenstream::TokenStream;
     type TokenStreamBuilder = tokenstream::TokenStreamBuilder;
     type TokenCursor = tokenstream::Cursor;
     type SourceFile = Lrc<FileMap>;
     type Diagnostic = Diagnostic;
-    type Span = syntax_pos::Span;
+    type Span = Span;
+    type Term = Symbol;
+
+    type TokenNode = TokenNode<Self>;
 
     fn token_stream_empty(&self) -> Self::TokenStream {
         tokenstream::TokenStream::empty()
@@ -165,34 +158,30 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
         let span = call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark));
         Ok(parse::parse_stream_from_source_str(name, src, self.sess, Some(span)))
     }
-    fn token_stream_delimited(&self, span: Self::Span,
-                              delimiter: ::Delimiter,
-                              delimed: Self::TokenStream)
-                              -> Self::TokenStream {
-        tokenstream::TokenTree::Delimited(span, tokenstream::Delimited {
-            delim: delimiter.to_internal(),
-            tts: delimed.into(),
-        }).into()
-    }
-    fn token_stream_from_token_tree(&self, node: ::TokenNode, span: Self::Span)
+    fn token_stream_from_token_tree(&self, node: Self::TokenNode, span: Self::Span)
                                     -> Self::TokenStream {
         use self::syntax::parse::token::*;
         use self::syntax::tokenstream::TokenTree;
 
         let (op, kind) = match node {
             TokenNode::Op(op, kind) => (op, kind),
-            TokenNode::Group(..) => unreachable!(),
+            TokenNode::Group(delimiter, delimed) => {
+                return tokenstream::TokenTree::Delimited(span, tokenstream::Delimited {
+                    delim: delimiter.to_internal(),
+                    tts: delimed.into(),
+                }).into();
+            }
             TokenNode::Term(symbol) => {
-                let ident = ast::Ident { name: symbol.0, ctxt: span.ctxt() };
-                let token = if symbol.0.as_str().starts_with("'") {
+                let ident = ast::Ident { name: symbol, ctxt: span.ctxt() };
+                let token = if symbol.as_str().starts_with("'") {
                     Lifetime(ident)
                 } else {
                     Ident(ident)
                 };
                 return TokenTree::Token(span, token).into();
             }
-            TokenNode::Literal(literal) => {
-                return TokenTree::Token(span, literal.to_internal()).into()
+            TokenNode::Literal(kind, contents, suffix) => {
+                return TokenTree::Token(span, kind.to_internal(contents, suffix)).into()
             }
         };
 
@@ -228,9 +217,8 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
         }
     }
     fn token_stream_to_token_tree(&self, stream: Self::TokenStream)
-                                  -> (Self::Span,
-                                      Result<(::TokenNode, Option<Self::TokenStream>),
-                                             (::Delimiter, Self::TokenStream)>) {
+                                  -> ((Self::Span, Self::TokenNode),
+                                      Option<Self::TokenStream>) {
         use self::syntax::parse::token::*;
 
         let mut next = None;
@@ -239,7 +227,7 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
         let (mut span, token) = match tree {
             tokenstream::TokenTree::Delimited(span, delimed) => {
                 let delimiter = Delimiter::from_internal(delimed.delim);
-                return (span, Err((delimiter, delimed.tts.into())));
+                return ((span, TokenNode::Group(delimiter, delimed.tts.into())), next);
             }
             tokenstream::TokenTree::Token(span, token) => (span, token),
         };
@@ -255,9 +243,9 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
             }
         }
 
-        fn joint(first: char, rest: Token, is_joint: bool, span: &mut syntax_pos::Span,
-                next: &mut Option<tokenstream::TokenStream>)
-                -> TokenNode {
+        fn joint<'a>(first: char, rest: Token, is_joint: bool, span: &mut Span,
+                     next: &mut Option<tokenstream::TokenStream>)
+                     -> TokenNode<Rustc<'a>> {
             let (first_span, rest_span) = (*span, *span);
             *span = first_span;
             let tree = tokenstream::TokenTree::Token(rest_span, rest);
@@ -313,14 +301,15 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
             Dollar => op!('$'),
             Question => op!('?'),
 
-            Ident(ident) | Lifetime(ident) => TokenNode::Term(Term(ident.name)),
+            Ident(ident) | Lifetime(ident) => TokenNode::Term(ident.name),
             Literal(..) | DocComment(..) => {
-                TokenNode::Literal(::Literal::from_internal(token))
+                let (kind, contents, suffix) = LiteralKind::from_internal(token);
+                TokenNode::Literal(kind, contents, suffix)
             }
 
             Interpolated(_) => {
                 let tts = token.interpolated_to_tokenstream(self.sess, span);
-                return (span, Err((Delimiter::None, tts)));
+                TokenNode::Group(Delimiter::None, tts)
             }
 
             DotEq => joint!('.', Eq),
@@ -328,7 +317,7 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
             Whitespace | Comment | Shebang(..) | Eof => unreachable!(),
         };
 
-        (span, Ok((kind, next)))
+        ((span, kind), next)
     }
     fn token_stream_trees(&self, stream: Self::TokenStream) -> Self::TokenCursor {
         stream.trees()
@@ -441,5 +430,12 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
     }
     fn span_resolved_at(&self, span: Self::Span, at: Self::Span) -> Self::Span {
         span.with_ctxt(at.ctxt())
+    }
+
+    fn term_intern(&self, string: &str) -> Self::Term {
+        Symbol::intern(string)
+    }
+    fn term_as_str(&self, term: Self::Term) -> ThreadRef<str> {
+        ThreadRef::new(unsafe { &*(&*term.as_str() as *const str) })
     }
 }

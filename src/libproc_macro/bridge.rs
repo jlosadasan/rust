@@ -21,10 +21,11 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 
-use self::storage::{FromConcrete, ToConcrete};
+use self::storage::{FromConcrete, ToConcrete, Storage};
 
 mod generation {
     use std::cell::Cell;
@@ -233,14 +234,39 @@ mod storage {
     }
 }
 
+/// Thread-local reference, to be used in place of `&'static T`
+/// when it shouldn't be allowed to escape the thread.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ThreadRef<T: ?Sized + 'static>(&'static T);
+
+impl<T: ?Sized + 'static> !Send for ThreadRef<T> {}
+impl<T: ?Sized + 'static> !Sync for ThreadRef<T> {}
+
+impl<T: ?Sized + 'static> Deref for ThreadRef<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
+impl<T: ?Sized + 'static> ThreadRef<T> {
+    pub fn new(x: &'static T) -> Self {
+        ThreadRef(x)
+    }
+}
+
 storage_concrete_passthrough! {
     [] (),
     [] bool,
+    [] char,
     ['a] &'a str,
+    [] ThreadRef<str>,
 
     // FIXME(eddyb) achieve ABI compatibility for these types.
-    [] ::TokenNode,
     [] ::Delimiter,
+    [] ::LiteralKind,
+    [] ::Spacing,
     [] ::LexError,
     [] ::LineColumn,
     [] ::Level,
@@ -269,16 +295,11 @@ macro_rules! each_frontend_method {
         $meth!(fn token_stream_is_empty(&self, stream: &Self::TokenStream) -> bool;);
         $meth!(fn token_stream_from_str(&self, src: &str)
                                         -> Result<Self::TokenStream, ::LexError>;);
-        $meth!(fn token_stream_delimited(&self, span: Self::Span,
-                                         delimiter: ::Delimiter,
-                                         delimed: Self::TokenStream)
-                                         -> Self::TokenStream;);
-        $meth!(fn token_stream_from_token_tree(&self, node: ::TokenNode, span: Self::Span)
+        $meth!(fn token_stream_from_token_tree(&self, node: Self::TokenNode, span: Self::Span)
                                                -> Self::TokenStream;);
         $meth!(fn token_stream_to_token_tree(&self, stream: Self::TokenStream)
-                                             -> (Self::Span,
-                                                 Result<(::TokenNode, Option<Self::TokenStream>),
-                                                        (::Delimiter, Self::TokenStream)>););
+                                             -> ((Self::Span, Self::TokenNode),
+                                                 Option<Self::TokenStream>););
         $meth!(fn token_stream_trees(&self, stream: Self::TokenStream) -> Self::TokenCursor;);
 
         $meth!(fn token_stream_builder_cleanup(&self, _builder: Self::TokenStreamBuilder) -> () {});
@@ -323,6 +344,12 @@ macro_rules! each_frontend_method {
         $meth!(fn span_end(&self, span: Self::Span) -> ::LineColumn;);
         $meth!(fn span_join(&self, first: Self::Span, second: Self::Span) -> Option<Self::Span>;);
         $meth!(fn span_resolved_at(&self, span: Self::Span, at: Self::Span) -> Self::Span;);
+
+        $meth!(fn term_debug(&self, term: Self::Term, f: &mut fmt::Formatter) -> fmt::Result {
+            fmt::Debug::fmt(&term, f)
+        });
+        $meth!(fn term_intern(&self, string: &str) -> Self::Term;);
+        $meth!(fn term_as_str(&self, term: Self::Term) -> ThreadRef<str>;);
     }
 }
 
@@ -337,8 +364,48 @@ pub trait FrontendInterface {
     type Diagnostic: 'static;
     /// NB. has to be the same size as u32.
     type Span: 'static + Copy + Eq + fmt::Debug;
+    /// NB. has to be the same size as u32.
+    type Term: 'static + Copy + Eq + fmt::Debug;
+    /// Only needed for object safety, should always be `TokenNode<Self>`.
+    type TokenNode;
     each_frontend_method!(define_frontend_trait_method);
 }
+
+macro_rules! frontend_wrapper {
+    (enum $name:ident<$F:ident> { $($variant:ident($($field:ident: $field_ty:ty),*)),* }) => {
+        #[repr(C)]
+        pub enum $name<$F: FrontendInterface> {
+            $($variant($($field_ty),*)),*
+        }
+
+        impl<F: FrontendInterface> FromConcrete<$name<F>, $name<Frontend>> for Storage<F> {
+            fn from_concrete(&self, x: $name<F>) -> $name<Frontend> {
+                match x {
+                    $($name::$variant($($field),*) => {
+                        $name::$variant($(self.from_concrete($field)),*)
+                    }),*
+                }
+            }
+        }
+
+        impl<F: FrontendInterface> ToConcrete<$name<Frontend>, $name<F>> for Storage<F> {
+            fn to_concrete(&self, x: $name<Frontend>) -> $name<F> {
+                match x {
+                    $($name::$variant($($field),*) => {
+                        $name::$variant($(self.to_concrete($field)),*)
+                    }),*
+                }
+            }
+        }
+    }
+}
+
+frontend_wrapper!(enum TokenNode<F> {
+    Group(delim: ::Delimiter, delimed: F::TokenStream),
+    Term(term: F::Term),
+    Op(op: char, spacing: ::Spacing),
+    Literal(kind: ::LiteralKind, contents: F::Term, suffix: Option<F::Term>)
+});
 
 macro_rules! define_boxed {
     ($($name:ident { cleanup: $cleanup:ident }),*) => {
@@ -353,28 +420,28 @@ macro_rules! define_boxed {
                     Frontend.$cleanup($name(boxed))
                 }
             }
-            impl<S, T: 'static> FromConcrete<T, $name> for storage::Storage<S>
+            impl<S, T: 'static> FromConcrete<T, $name> for Storage<S>
                 where $name: storage::Concrete<S, Concrete = T>
             {
                 fn from_concrete(&self, x: T) -> $name {
                     $name(self.from_concrete(Box::new(x)))
                 }
             }
-            impl<S, T: 'static> ToConcrete<$name, T> for storage::Storage<S>
+            impl<S, T: 'static> ToConcrete<$name, T> for Storage<S>
                 where $name: storage::Concrete<S, Concrete = T>
             {
                 fn to_concrete(&self, x: $name) -> T {
                     *self.to_concrete(x.0)
                 }
             }
-            impl<'a, S, T: 'static> ToConcrete<&'a $name, &'a T> for storage::Storage<S>
+            impl<'a, S, T: 'static> ToConcrete<&'a $name, &'a T> for Storage<S>
                 where $name: storage::Concrete<S, Concrete = T>
             {
                 fn to_concrete(&self, x: &'a $name) -> &'a T {
                     self.to_concrete(&x.0)
                 }
             }
-            impl<'a, S, T: 'static> ToConcrete<&'a mut $name, &'a mut T> for storage::Storage<S>
+            impl<'a, S, T: 'static> ToConcrete<&'a mut $name, &'a mut T> for Storage<S>
                 where $name: storage::Concrete<S, Concrete = T>
             {
                 fn to_concrete(&self, x: &'a mut $name) -> &'a mut T {
@@ -442,14 +509,14 @@ macro_rules! define_inline {
             impl<F: FrontendInterface> storage::Concrete<F> for $name {
                 type Concrete = F::$name;
             }
-            impl<S, T: Copy + 'static> FromConcrete<T, $name> for storage::Storage<S>
+            impl<S, T: Copy + 'static> FromConcrete<T, $name> for Storage<S>
                 where $name: storage::Concrete<S, Concrete = T>
             {
                 fn from_concrete(&self, x: T) -> $name {
                     $name(self.from_concrete(x))
                 }
             }
-            impl<S, T: Copy + 'static> ToConcrete<$name, T> for storage::Storage<S>
+            impl<S, T: Copy + 'static> ToConcrete<$name, T> for Storage<S>
                 where $name: storage::Concrete<S, Concrete = T>
             {
                 fn to_concrete(&self, x: $name) -> T {
@@ -460,11 +527,17 @@ macro_rules! define_inline {
     }
 }
 
-define_inline!(Span);
+define_inline!(Span, Term);
 
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         Frontend.span_debug(*self, f)
+    }
+}
+
+impl fmt::Debug for Term {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        Frontend.term_debug(*self, f)
     }
 }
 
@@ -485,6 +558,8 @@ impl FrontendInterface for Frontend {
     type SourceFile = SourceFile;
     type Diagnostic = Diagnostic;
     type Span = Span;
+    type Term = Term;
+    type TokenNode = TokenNode<Frontend>;
     each_frontend_method!(define_frontend_current_method);
 }
 
@@ -496,6 +571,8 @@ type CurrentFrontend<'a> = FrontendInterface<
     SourceFile = SourceFile,
     Diagnostic = Diagnostic,
     Span = Span,
+    Term = Term,
+    TokenNode = TokenNode<Frontend>,
 > + 'a;
 
 // Emulate scoped_thread_local!() here essentially
@@ -537,11 +614,11 @@ fn set_current_frontend<F, R>(frontend: &CurrentFrontend, f: F) -> R
 fn erase_concrete_frontend<F, G, R>(ng: extern "C" fn() -> generation::Generation,
                                     frontend: F,
                                     f: G) -> R
-    where F: FrontendInterface,
-          G: FnOnce(&CurrentFrontend, &storage::Storage<F>) -> R
+    where F: FrontendInterface<TokenNode = TokenNode<F>>,
+          G: FnOnce(&CurrentFrontend, &Storage<F>) -> R
 {
-    struct EraseConcrete<F: FrontendInterface> {
-        storage: storage::Storage<F>,
+    struct EraseConcrete<F: FrontendInterface<TokenNode = TokenNode<F>>> {
+        storage: Storage<F>,
         concrete: F
     }
 
@@ -554,18 +631,20 @@ fn erase_concrete_frontend<F, G, R>(ng: extern "C" fn() -> generation::Generatio
             }
         }
     }
-    impl<F: FrontendInterface> FrontendInterface for EraseConcrete<F> {
+    impl<F: FrontendInterface<TokenNode = TokenNode<F>>> FrontendInterface for EraseConcrete<F> {
         type TokenStream = TokenStream;
         type TokenStreamBuilder = TokenStreamBuilder;
         type TokenCursor = TokenCursor;
         type SourceFile = SourceFile;
         type Diagnostic = Diagnostic;
         type Span = Span;
+        type Term = Term;
+        type TokenNode = TokenNode<Frontend>;
         each_frontend_method!(define_frontend_erase_concrete_method);
     }
 
     let frontend = EraseConcrete {
-        storage: storage::Storage::new(ng),
+        storage: Storage::new(ng),
         concrete: frontend
     };
     f(&frontend, &frontend.storage)
@@ -607,7 +686,7 @@ impl Expand1 {
     }
 
     pub fn run<F>(&self, frontend: F, input: F::TokenStream) -> F::TokenStream
-        where F: FrontendInterface
+        where F: FrontendInterface<TokenNode = TokenNode<F>>
     {
         erase_concrete_frontend(self.next_generation, frontend, |frontend, storage| {
             let input = storage.from_concrete(input);
@@ -657,7 +736,7 @@ impl Expand2 {
 
     pub fn run<F>(&self, frontend: F, input: F::TokenStream, input2: F::TokenStream)
                   -> F::TokenStream
-        where F: FrontendInterface
+        where F: FrontendInterface<TokenNode = TokenNode<F>>
     {
         erase_concrete_frontend(self.next_generation, frontend, |frontend, storage| {
             let input = storage.from_concrete(input);

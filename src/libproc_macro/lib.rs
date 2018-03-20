@@ -121,12 +121,16 @@ pub fn quote_token_stream(stream: TokenStream) -> TokenStream {
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl From<TokenTree> for TokenStream {
     fn from(tree: TokenTree) -> TokenStream {
-        TokenStream(match tree.kind {
-            TokenNode::Group(delimiter, tokens) => {
-                Frontend.token_stream_delimited(tree.span.0, delimiter, tokens.0)
+        TokenStream(Frontend.token_stream_from_token_tree(match tree.kind {
+            TokenNode::Group(delim, delimed) => {
+                bridge::TokenNode::Group(delim, delimed.0)
             }
-            _ => Frontend.token_stream_from_token_tree(tree.kind, tree.span.0)
-        })
+            TokenNode::Term(term) => bridge::TokenNode::Term(term.0),
+            TokenNode::Op(c, s) => bridge::TokenNode::Op(c, s),
+            TokenNode::Literal(Literal { kind, contents, suffix }) => {
+                bridge::TokenNode::Literal(kind, contents.0, suffix.map(|s| s.0))
+            }
+        }, tree.span.0))
     }
 }
 
@@ -393,19 +397,19 @@ pub enum Delimiter {
 /// An interned string.
 #[derive(Copy, Clone, Debug)]
 #[unstable(feature = "proc_macro", issue = "38356")]
-pub struct Term(::rustc::Symbol);
+pub struct Term(bridge::Term);
 
 impl Term {
     /// Intern a string into a `Term`.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn intern(string: &str) -> Term {
-        Term(::rustc::Symbol::intern(string))
+        Term(Frontend.term_intern(string))
     }
 
     /// Get a reference to the interned string.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn as_str(&self) -> &str {
-        unsafe { &*(&*self.0.as_str() as *const str) }
+        unsafe { &*(&*Frontend.term_as_str(self.0) as *const str) }
     }
 }
 
@@ -597,18 +601,24 @@ impl Iterator for TokenTreeIter {
         let next = self.next.take().or_else(|| {
             Frontend.token_cursor_next(&mut self.cursor)
         })?;
-        let (span, kind) = match Frontend.token_stream_to_token_tree(next) {
-            (span, Ok((kind, next))) => {
-                self.next = next;
-                (span, kind)
-            }
-            (span, Err((delimiter, delimed))) => {
-                (span, TokenNode::Group(delimiter, TokenStream(delimed)))
-            }
-        };
+        let ((span, kind), next) = Frontend.token_stream_to_token_tree(next);
+        self.next = next;
         Some(TokenTree {
             span: Span(span),
-            kind
+            kind: match kind {
+                bridge::TokenNode::Group(delim, delimed) => {
+                    TokenNode::Group(delim, TokenStream(delimed))
+                }
+                bridge::TokenNode::Term(term) => TokenNode::Term(Term(term)),
+                bridge::TokenNode::Op(c, s) => TokenNode::Op(c, s),
+                bridge::TokenNode::Literal(kind, contents, suffix) => {
+                    TokenNode::Literal(Literal {
+                        kind,
+                        contents: Term(contents),
+                        suffix: suffix.map(Term)
+                    })
+                }
+            }
         })
     }
 }
