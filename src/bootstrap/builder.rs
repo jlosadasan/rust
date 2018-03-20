@@ -306,7 +306,7 @@ impl<'a> Builder<'a> {
                 test::CompileFail, test::ParseFail, test::RunFail, test::RunPassValgrind,
                 test::MirOpt, test::Codegen, test::CodegenUnits, test::Incremental, test::Debuginfo,
                 test::UiFullDeps, test::RunPassFullDeps, test::RunFailFullDeps,
-                test::CompileFailFullDeps, test::IncrementalFullDeps, test::Rustdoc, test::Pretty,
+                test::CompileFailFullDeps, test::Rustdoc, test::Pretty,
                 test::RunPassPretty, test::RunFailPretty, test::RunPassValgrindPretty,
                 test::RunPassFullDepsPretty, test::RunFailFullDepsPretty, test::RunMake,
                 test::Crate, test::CrateLibrustc, test::CrateRustdoc, test::Linkcheck,
