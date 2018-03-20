@@ -42,11 +42,6 @@
 #![feature(box_into_raw_non_null)]
 #![feature(nonnull_cast)]
 
-extern crate syntax;
-extern crate syntax_pos;
-extern crate rustc_errors;
-extern crate rustc_data_structures;
-
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
 #[doc(hidden)]
 pub mod bridge;
@@ -65,8 +60,6 @@ pub use diagnostic::{Diagnostic, Level};
 use std::{ascii, fmt, iter};
 use std::path::PathBuf;
 use std::str::FromStr;
-
-use syntax::symbol::Symbol;
 
 /// The main type provided by this crate, representing an abstract stream of
 /// tokens.
@@ -400,13 +393,13 @@ pub enum Delimiter {
 /// An interned string.
 #[derive(Copy, Clone, Debug)]
 #[unstable(feature = "proc_macro", issue = "38356")]
-pub struct Term(Symbol);
+pub struct Term(::rustc::Symbol);
 
 impl Term {
     /// Intern a string into a `Term`.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn intern(string: &str) -> Term {
-        Term(Symbol::intern(string))
+        Term(::rustc::Symbol::intern(string))
     }
 
     /// Get a reference to the interned string.

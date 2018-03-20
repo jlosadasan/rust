@@ -8,17 +8,24 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+extern crate syntax;
+extern crate syntax_pos;
+extern crate rustc_errors;
+extern crate rustc_data_structures;
+
 use {Delimiter, Literal, LiteralKind, Spacing, Term, TokenNode};
 
-use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Diagnostic, DiagnosticBuilder, Level};
 use std::path::PathBuf;
-use syntax_pos::{self, SyntaxContext, FileMap, FileName, MultiSpan, Pos, DUMMY_SP};
-use syntax_pos::hygiene::Mark;
-use syntax::ast;
-use syntax::ext::base::{ExtCtxt, ProcMacro};
-use syntax::parse::{self, token, ParseSess};
-use syntax::tokenstream;
+use self::rustc_data_structures::sync::Lrc;
+use self::rustc_errors::{Diagnostic, DiagnosticBuilder, Level};
+use self::syntax_pos::{SyntaxContext, FileMap, FileName, MultiSpan, Pos, DUMMY_SP};
+use self::syntax_pos::hygiene::Mark;
+use self::syntax::ast;
+use self::syntax::ext::base::{ExtCtxt, ProcMacro};
+use self::syntax::parse::{self, token, ParseSess};
+use self::syntax::tokenstream;
+
+pub use self::syntax_pos::symbol::Symbol;
 
 pub struct Quoter;
 
@@ -169,8 +176,8 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
     }
     fn token_stream_from_token_tree(&self, node: ::TokenNode, span: Self::Span)
                                     -> Self::TokenStream {
-        use syntax::parse::token::*;
-        use syntax::tokenstream::TokenTree;
+        use self::syntax::parse::token::*;
+        use self::syntax::tokenstream::TokenTree;
 
         let (op, kind) = match node {
             TokenNode::Op(op, kind) => (op, kind),
@@ -224,7 +231,7 @@ impl<'a> ::bridge::FrontendInterface for Rustc<'a> {
                                   -> (Self::Span,
                                       Result<(::TokenNode, Option<Self::TokenStream>),
                                              (::Delimiter, Self::TokenStream)>) {
-        use syntax::parse::token::*;
+        use self::syntax::parse::token::*;
 
         let mut next = None;
 
