@@ -15,6 +15,7 @@
        html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![deny(warnings)]
 
+#![feature(proc_macro)]
 #![feature(proc_macro_internals)]
 #![feature(decl_macro)]
 #![feature(str_escape)]

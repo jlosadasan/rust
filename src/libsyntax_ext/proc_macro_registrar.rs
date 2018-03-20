@@ -348,12 +348,14 @@ impl<'a> Visitor<'a> for CollectProcMacros<'a> {
 //      mod $gensym {
 //          extern crate proc_macro;
 //
-//          use proc_macro::__internal::Registry;
+//          use proc_macro::bridge::{Expand1, Expand2, Registry};
 //
 //          #[plugin_registrar]
 //          fn registrar(registrar: &mut Registry) {
-//              registrar.register_custom_derive($name_trait1, ::$name1, &[]);
-//              registrar.register_custom_derive($name_trait2, ::$name2, &["attribute_name"]);
+//              registrar.register_custom_derive($name_trait1,
+//                  Expand1::new(&::$name1), &[]);
+//              registrar.register_custom_derive($name_trait2,
+//                  Expand1::new(&::$name2), &["attribute_name"]);
 //              // ...
 //          }
 //      }
@@ -371,7 +373,8 @@ fn mk_registrar(cx: &mut ExtCtxt,
             allow_internal_unsafe: false,
         }
     });
-    let span = DUMMY_SP.with_ctxt(SyntaxContext::empty().apply_mark(mark));
+    let ctxt = SyntaxContext::empty().apply_mark(mark);
+    let span = DUMMY_SP.with_ctxt(ctxt);
 
     let proc_macro = Ident::from_str("proc_macro");
     let krate = cx.item(span,
@@ -379,7 +382,10 @@ fn mk_registrar(cx: &mut ExtCtxt,
                         Vec::new(),
                         ast::ItemKind::ExternCrate(None));
 
-    let __internal = Ident::from_str("__internal");
+    let bridge = Ident::from_str("bridge");
+    let expand1 = Ident::from_str("Expand1");
+    let expand2 = Ident::from_str("Expand2");
+    let new = Ident::from_str("new");
     let registry = Ident::from_str("Registry");
     let registrar = Ident::from_str("_registrar");
     let register_custom_derive = Ident::from_str("register_custom_derive");
@@ -387,46 +393,61 @@ fn mk_registrar(cx: &mut ExtCtxt,
     let register_bang_proc_macro = Ident::from_str("register_bang_proc_macro");
 
     let mut stmts = custom_derives.iter().map(|cd| {
-        let path = cx.path_global(cd.span, vec![cd.function_name]);
+        let expand = cx.expr_path(cx.path_global(cd.span, vec![cd.function_name]));
+        let expand = cx.expr_addr_of(span, expand);
+        let expand_span = cd.span.with_ctxt(ctxt);
+        let expand = cx.expr_call(expand_span, cx.expr_path(cx.path(expand_span, vec![
+            proc_macro, bridge, expand1, new
+        ])), vec![expand]);
         let trait_name = cx.expr_str(cd.span, cd.trait_name);
         let attrs = cx.expr_vec_slice(
             span,
             cd.attrs.iter().map(|&s| cx.expr_str(cd.span, s)).collect::<Vec<_>>()
         );
         let registrar = cx.expr_ident(span, registrar);
-        let ufcs_path = cx.path(span, vec![proc_macro, __internal, registry,
+        let ufcs_path = cx.path(span, vec![proc_macro, bridge, registry,
                                            register_custom_derive]);
 
         cx.stmt_expr(cx.expr_call(span, cx.expr_path(ufcs_path),
-                                  vec![registrar, trait_name, cx.expr_path(path), attrs]))
+                                  vec![registrar, trait_name, expand, attrs]))
 
     }).collect::<Vec<_>>();
 
     stmts.extend(custom_attrs.iter().map(|ca| {
         let name = cx.expr_str(ca.span, ca.function_name.name);
-        let path = cx.path_global(ca.span, vec![ca.function_name]);
+        let expand = cx.expr_path(cx.path_global(ca.span, vec![ca.function_name]));
+        let expand = cx.expr_addr_of(span, expand);
+        let expand_span = ca.span.with_ctxt(ctxt);
+        let expand = cx.expr_call(expand_span, cx.expr_path(cx.path(expand_span, vec![
+            proc_macro, bridge, expand2, new
+        ])), vec![expand]);
         let registrar = cx.expr_ident(ca.span, registrar);
 
         let ufcs_path = cx.path(span,
-                                vec![proc_macro, __internal, registry, register_attr_proc_macro]);
+                                vec![proc_macro, bridge, registry, register_attr_proc_macro]);
 
         cx.stmt_expr(cx.expr_call(span, cx.expr_path(ufcs_path),
-                                  vec![registrar, name, cx.expr_path(path)]))
+                                  vec![registrar, name, expand]))
     }));
 
     stmts.extend(custom_macros.iter().map(|cm| {
         let name = cx.expr_str(cm.span, cm.function_name.name);
-        let path = cx.path_global(cm.span, vec![cm.function_name]);
+        let expand = cx.expr_path(cx.path_global(cm.span, vec![cm.function_name]));
+        let expand = cx.expr_addr_of(span, expand);
+        let expand_span = cm.span.with_ctxt(ctxt);
+        let expand = cx.expr_call(expand_span, cx.expr_path(cx.path(expand_span, vec![
+            proc_macro, bridge, expand1, new
+        ])), vec![expand]);
         let registrar = cx.expr_ident(cm.span, registrar);
 
         let ufcs_path = cx.path(span,
-                                vec![proc_macro, __internal, registry, register_bang_proc_macro]);
+                                vec![proc_macro, bridge, registry, register_bang_proc_macro]);
 
         cx.stmt_expr(cx.expr_call(span, cx.expr_path(ufcs_path),
-                                  vec![registrar, name, cx.expr_path(path)]))
+                                  vec![registrar, name, expand]))
     }));
 
-    let path = cx.path(span, vec![proc_macro, __internal, registry]);
+    let path = cx.path(span, vec![proc_macro, bridge, registry]);
     let registrar_path = cx.ty_path(path);
     let arg_ty = cx.ty_rptr(span, registrar_path, None, ast::Mutability::Mutable);
     let func = cx.item_fn(span,

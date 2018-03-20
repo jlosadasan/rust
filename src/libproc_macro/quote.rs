@@ -14,17 +14,7 @@
 //! This quasiquoter uses macros 2.0 hygiene to reliably access
 //! items from `proc_macro`, to build a `proc_macro::TokenStream`.
 
-use {Delimiter, Literal, Spacing, Span, Term, TokenNode, TokenStream, TokenTree};
-
-use syntax::ext::base::{ExtCtxt, ProcMacro};
-use syntax::parse::token;
-use syntax::tokenstream;
-
-pub struct Quoter;
-
-pub fn unquote<T: Into<TokenStream> + Clone>(tokens: &T) -> TokenStream {
-    T::into(tokens.clone())
-}
+use {Delimiter, Literal, LiteralKind, Spacing, Span, Term, TokenNode, TokenStream, TokenTree};
 
 pub trait Quote {
     fn quote(self) -> TokenStream;
@@ -67,18 +57,6 @@ macro_rules! quote {
     };
 }
 
-impl ProcMacro for Quoter {
-    fn expand<'cx>(&self, cx: &'cx mut ExtCtxt,
-                   _: ::syntax_pos::Span,
-                   stream: tokenstream::TokenStream)
-                   -> tokenstream::TokenStream {
-        let mut info = cx.current_expansion.mark.expn_info().unwrap();
-        info.callee.allow_internal_unstable = true;
-        cx.current_expansion.mark.set_expn_info(info);
-        ::__internal::set_sess(cx, || TokenStream(stream).quote().0)
-    }
-}
-
 impl<T: Quote> Quote for Option<T> {
     fn quote(self) -> TokenStream {
         match self {
@@ -99,7 +77,8 @@ impl Quote for TokenStream {
                 after_dollar = false;
                 match tree.kind {
                     TokenNode::Term(_) => {
-                        return Some(quote!(::__internal::unquote(&(unquote tree)),));
+                        return Some(quote!(Into::<::TokenStream>::into(
+                            Clone::clone(&(unquote tree))),));
                     }
                     TokenNode::Op('$', _) => {}
                     _ => panic!("`$` must be followed by an ident or `$` in `quote!`"),
@@ -172,69 +151,31 @@ impl Quote for Span {
     }
 }
 
-macro_rules! literals {
-    ($($i:ident),*; $($raw:ident),*) => {
-        pub enum LiteralKind {
-            $($i,)*
-            $($raw(usize),)*
-        }
-
-        impl LiteralKind {
-            pub fn with_contents_and_suffix(self, contents: Term, suffix: Option<Term>)
-                                            -> Literal {
-                let contents = contents.0;
-                let suffix = suffix.map(|t| t.0);
+impl Quote for LiteralKind {
+    fn quote(self) -> TokenStream {
+        macro_rules! gen_match {
+            ($($i:ident),*; $($raw:ident),*) => {
                 match self {
-                    $(LiteralKind::$i => {
-                        Literal(token::Literal(token::Lit::$i(contents), suffix))
-                    })*
-                    $(LiteralKind::$raw(n) => {
-                        Literal(token::Literal(token::Lit::$raw(contents, n), suffix))
-                    })*
+                    $(LiteralKind::$i => quote!(::LiteralKind::$i),)*
+                    $(LiteralKind::$raw(n) => quote!(::LiteralKind::$raw((quote n))),)*
                 }
             }
         }
 
-        impl Literal {
-            fn kind_contents_and_suffix(self) -> (LiteralKind, Term, Option<Term>) {
-                let (lit, suffix) = match self.0 {
-                    token::Literal(lit, suffix) => (lit, suffix),
-                    _ => panic!("unsupported literal {:?}", self.0),
-                };
-
-                let (kind, contents) = match lit {
-                    $(token::Lit::$i(contents) => (LiteralKind::$i, contents),)*
-                    $(token::Lit::$raw(contents, n) => (LiteralKind::$raw(n), contents),)*
-                };
-                (kind, Term(contents), suffix.map(Term))
-            }
-        }
-
-        impl Quote for LiteralKind {
-            fn quote(self) -> TokenStream {
-                match self {
-                    $(LiteralKind::$i => quote! {
-                        ::__internal::LiteralKind::$i
-                    },)*
-                    $(LiteralKind::$raw(n) => quote! {
-                        ::__internal::LiteralKind::$raw((quote n))
-                    },)*
-                }
-            }
-        }
-
-        impl Quote for Literal {
-            fn quote(self) -> TokenStream {
-                let (kind, contents, suffix) = self.kind_contents_and_suffix();
-                quote! {
-                    (quote kind).with_contents_and_suffix((quote contents), (quote suffix))
-                }
-            }
-        }
+        gen_match!(DocComment, Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw)
     }
 }
 
-literals!(Byte, Char, Float, Str_, Integer, ByteStr; StrRaw, ByteStrRaw);
+
+impl Quote for Literal {
+    fn quote(self) -> TokenStream {
+        quote!(::Literal {
+            kind: (quote self.kind),
+            contents: (quote self.contents),
+            suffix: (quote self.suffix),
+        })
+    }
+}
 
 impl Quote for Delimiter {
     fn quote(self) -> TokenStream {

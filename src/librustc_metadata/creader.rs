@@ -514,8 +514,7 @@ impl<'a> CrateLoader<'a> {
     fn load_derive_macros(&mut self, root: &CrateRoot, dylib: Option<PathBuf>, span: Span)
                           -> Vec<(ast::Name, Lrc<SyntaxExtension>)> {
         use std::{env, mem};
-        use proc_macro::TokenStream;
-        use proc_macro::__internal::Registry;
+        use proc_macro::bridge::{Registry, Expand1, Expand2};
         use dynamic_lib::DynamicLibrary;
         use syntax_ext::deriving::custom::ProcMacroDerive;
         use syntax_ext::proc_macro_impl::{AttrProcMacro, BangProcMacro};
@@ -545,7 +544,7 @@ impl<'a> CrateLoader<'a> {
         impl Registry for MyRegistrar {
             fn register_custom_derive(&mut self,
                                       trait_name: &str,
-                                      expand: fn(TokenStream) -> TokenStream,
+                                      expand: Expand1,
                                       attributes: &[&'static str]) {
                 let attrs = attributes.iter().cloned().map(Symbol::intern).collect::<Vec<_>>();
                 let derive = ProcMacroDerive::new(expand, attrs.clone());
@@ -555,7 +554,7 @@ impl<'a> CrateLoader<'a> {
 
             fn register_attr_proc_macro(&mut self,
                                         name: &str,
-                                        expand: fn(TokenStream, TokenStream) -> TokenStream) {
+                                        expand: Expand2) {
                 let expand = SyntaxExtension::AttrProcMacro(
                     Box::new(AttrProcMacro { inner: expand })
                 );
@@ -564,7 +563,7 @@ impl<'a> CrateLoader<'a> {
 
             fn register_bang_proc_macro(&mut self,
                                         name: &str,
-                                        expand: fn(TokenStream) -> TokenStream) {
+                                        expand: Expand1) {
                 let expand = SyntaxExtension::ProcMacro(
                     Box::new(BangProcMacro { inner: expand })
                 );

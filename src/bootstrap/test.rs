@@ -704,12 +704,6 @@ host_test!(CompileFailFullDeps {
     suite: "compile-fail-fulldeps"
 });
 
-host_test!(IncrementalFullDeps {
-    path: "src/test/incremental-fulldeps",
-    mode: "incremental",
-    suite: "incremental-fulldeps"
-});
-
 host_test!(Rustdoc {
     path: "src/test/rustdoc",
     mode: "rustdoc",
