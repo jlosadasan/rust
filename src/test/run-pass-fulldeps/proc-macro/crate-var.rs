@@ -9,7 +9,6 @@
 // except according to those terms.
 
 // aux-build:double.rs
-// ignore-stage1
 
 #![allow(unused)]
 

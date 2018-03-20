@@ -9,7 +9,7 @@
 // except according to those terms.
 
 // aux-build:parent-source-spans.rs
-// ignore-stage1
+
 
 #![feature(proc_macro, decl_macro)]
 

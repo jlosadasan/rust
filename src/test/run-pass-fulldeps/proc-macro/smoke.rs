@@ -9,7 +9,6 @@
 // except according to those terms.
 
 // aux-build:derive-a.rs
-// ignore-stage1
 
 #[macro_use]
 extern crate derive_a;

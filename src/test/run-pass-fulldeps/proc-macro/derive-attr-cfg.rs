@@ -9,7 +9,6 @@
 // except according to those terms.
 
 // aux-build:derive-attr-cfg.rs
-// ignore-stage1
 
 #![feature(proc_macro)]
 
