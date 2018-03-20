@@ -80,7 +80,7 @@ impl MultiItemModifier for ProcMacroDerive {
         let token = Token::interpolated(token::NtItem(item));
         let input = tokenstream::TokenTree::Token(DUMMY_SP, token).into();
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            self.inner.run(::proc_macro::rustc::Rustc::new(ecx), input)
+            self.inner.run(::proc_macro_impl::Frontend::new(ecx), input)
         }));
 
         let stream = match res {

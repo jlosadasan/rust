@@ -48,10 +48,6 @@ pub mod bridge;
 
 use bridge::{Frontend, FrontendInterface};
 
-#[unstable(feature = "proc_macro_internals", issue = "27812")]
-#[doc(hidden)]
-pub mod rustc;
-
 mod diagnostic;
 
 #[unstable(feature = "proc_macro", issue = "38356")]

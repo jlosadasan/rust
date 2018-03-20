@@ -41,6 +41,7 @@ use syntax::ext::base::SyntaxExtension;
 use syntax::parse::filemap_to_stream;
 use syntax::symbol::Symbol;
 use syntax_pos::{Span, NO_EXPANSION, FileName};
+use syntax_ext::proc_macro_impl;
 use rustc_data_structures::indexed_set::IdxSetBuf;
 use rustc::hir;
 
@@ -502,7 +503,7 @@ impl CrateStore for cstore::CStore {
             return LoadedMacro::ProcMacro(proc_macros[id.index.to_proc_macro_index()].1.clone());
         } else if data.name == "proc_macro" &&
                   self.get_crate_data(id.krate).item_name(id.index) == "quote" {
-            let ext = SyntaxExtension::ProcMacro(Box::new(::proc_macro::rustc::Quoter));
+            let ext = SyntaxExtension::ProcMacro(Box::new(proc_macro_impl::Quoter));
             return LoadedMacro::ProcMacro(Lrc::new(ext));
         }
 
