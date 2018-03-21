@@ -27,6 +27,7 @@ fn main() {
                                    "InstrProfilingFile.c",
                                    "InstrProfilingMerge.c",
                                    "InstrProfilingMergeFile.c",
+                                   "InstrProfilingNameVar.c",
                                    "InstrProfilingPlatformDarwin.c",
                                    "InstrProfilingPlatformLinux.c",
                                    "InstrProfilingPlatformOther.c",
@@ -50,6 +51,7 @@ fn main() {
         cfg.flag("-fomit-frame-pointer");
         cfg.flag("-ffreestanding");
         cfg.define("VISIBILITY_HIDDEN", None);
+        cfg.define("COMPILER_RT_HAS_UNAME", Some("1"));
     }
 
     for src in profile_sources {
